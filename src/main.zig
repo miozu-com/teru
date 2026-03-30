@@ -135,6 +135,10 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     _ = &selection;
     var mouse_down = false;
     _ = &mouse_down;
+    var mouse_start_row: u16 = 0;
+    var mouse_start_col: u16 = 0;
+    _ = &mouse_start_row;
+    _ = &mouse_start_col;
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
@@ -245,10 +249,12 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                                 selection.clear();
                                 if (mux.getActivePane()) |pane| pane.grid.dirty = true;
                             }
-                            // Record click position for potential drag selection
+                            // Record click position — don't start selection yet.
+                            // Selection only begins on mouse_motion (drag).
                             const col: u16 = @intCast(@min(mouse.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
                             const row: u16 = @intCast(@min(mouse.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
-                            selection.begin(row, col);
+                            mouse_start_row = row;
+                            mouse_start_col = col;
                             mouse_down = true;
                         },
                         .middle => {
@@ -291,8 +297,12 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                 },
                 .mouse_motion => |motion| {
                     if (mouse_down) {
-                        const col: u16 = @intCast(motion.x / atlas.cell_width);
-                        const row: u16 = @intCast(motion.y / atlas.cell_height);
+                        const col: u16 = @intCast(@min(motion.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
+                        const row: u16 = @intCast(@min(motion.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
+                        // Start selection on first drag movement
+                        if (!selection.active) {
+                            selection.begin(mouse_start_row, mouse_start_col);
+                        }
                         selection.update(row, col);
                         // Mark grid dirty so selection highlight redraws
                         if (mux.getActivePane()) |pane| {
