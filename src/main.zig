@@ -4,8 +4,11 @@ const posix = std.posix;
 const Pty = @import("pty/Pty.zig");
 const Grid = @import("core/Grid.zig");
 const VtParser = @import("core/VtParser.zig");
+const Pane = @import("core/Pane.zig");
+const Multiplexer = @import("core/Multiplexer.zig");
 const ProcessGraph = @import("graph/ProcessGraph.zig");
 const Terminal = @import("core/Terminal.zig");
+const Session = @import("persist/Session.zig");
 const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
 const protocol = @import("agent/protocol.zig");
@@ -41,7 +44,7 @@ pub fn main() !void {
     }
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
-        out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\n");
+        out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\n");
         return;
     }
 
@@ -55,6 +58,30 @@ pub fn main() !void {
     }
     return runWindowedMode(allocator);
 }
+
+// ── Prefix key state ──────────────────────────────────────────────
+
+const PrefixState = struct {
+    awaiting: bool = false,
+    timestamp_ns: i128 = 0,
+
+    const TIMEOUT_NS: i128 = 1_000_000_000; // 1 second
+
+    fn activate(self: *PrefixState) void {
+        self.awaiting = true;
+        self.timestamp_ns = std.time.nanoTimestamp();
+    }
+
+    fn isExpired(self: *const PrefixState) bool {
+        if (!self.awaiting) return false;
+        const elapsed = std.time.nanoTimestamp() - self.timestamp_ns;
+        return elapsed > TIMEOUT_NS;
+    }
+
+    fn reset(self: *PrefixState) void {
+        self.awaiting = false;
+    }
+};
 
 fn runWindowedMode(allocator: std.mem.Allocator) !void {
     var graph = ProcessGraph.init(allocator);
@@ -74,10 +101,15 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     const grid_cols: u16 = @intCast(960 / atlas.cell_width);
     const grid_rows: u16 = @intCast(640 / atlas.cell_height);
 
-    var grid = try Grid.init(allocator, grid_rows, grid_cols);
-    defer grid.deinit(allocator);
+    // Multiplexer: manages all panes
+    var mux = Multiplexer.init(allocator);
+    defer mux.deinit();
 
-    var vt = VtParser.init(&grid);
+    // Spawn initial pane
+    const initial_id = try mux.spawnPane(grid_rows, grid_cols);
+    if (mux.getPaneById(initial_id)) |pane| {
+        _ = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid });
+    }
 
     // Keyboard input: xkbcommon translates XCB keycodes → UTF-8
     var keyboard = if (Keyboard != void)
@@ -88,31 +120,35 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
         if (keyboard) |*kb| kb.deinit();
     };
 
-    var pty = try Pty.spawn(.{ .rows = grid_rows, .cols = grid_cols });
-    defer pty.deinit();
-
-    _ = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pty.child_pid });
-
-    // Non-blocking PTY reads
-    const flags = try posix.fcntl(pty.master, posix.F.GETFL, 0);
-    _ = try posix.fcntl(pty.master, posix.F.SETFL, flags | 0x800);
-
+    var prefix = PrefixState{};
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
     while (running) {
+        // Check prefix timeout
+        if (prefix.isExpired()) {
+            prefix.reset();
+        }
+
         while (win.pollEvents()) |event| {
             switch (event) {
                 .close => running = false,
                 .resize => |sz| {
+                    // Resize renderer
                     renderer.resize(sz.width, sz.height);
+
+                    // Recalculate grid dimensions for each pane
                     const new_cols: u16 = @intCast(sz.width / atlas.cell_width);
                     const new_rows: u16 = @intCast(sz.height / atlas.cell_height);
-                    if (new_cols != grid.cols or new_rows != grid.rows) {
-                        grid.resize(allocator, new_rows, new_cols) catch {
-                            continue; // Grid keeps old size; skip PTY resize to avoid mismatch
-                        };
-                        pty.resize(new_rows, new_cols);
+
+                    // Resize all panes in the active workspace
+                    // In multi-pane mode, panes share the screen — each gets
+                    // a portion. For simplicity, resize all to the max grid
+                    // size and let renderAll handle clipping via layout rects.
+                    for (mux.panes.items) |*pane| {
+                        if (new_cols != pane.grid.cols or new_rows != pane.grid.rows) {
+                            pane.resize(allocator, new_rows, new_cols) catch continue;
+                        }
                     }
                 },
                 .key_press => |key| {
@@ -120,15 +156,43 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         if (keyboard) |*kb| {
                             var key_buf: [32]u8 = undefined;
                             const len = kb.processKey(key.keycode, true, &key_buf);
+
+                            // Check for Ctrl+Space (prefix key)
+                            if (len == 1 and key_buf[0] == 0) {
+                                // NUL byte = Ctrl+Space
+                                prefix.activate();
+                                continue;
+                            }
+
+                            if (prefix.awaiting) {
+                                prefix.reset();
+                                if (len > 0) {
+                                    handleMuxCommand(key_buf[0], &mux, &graph, &running, allocator, grid_rows, grid_cols);
+                                    continue;
+                                }
+                            }
+
+                            // Normal key — forward to active pane's PTY
                             if (len > 0) {
-                                _ = pty.write(key_buf[0..len]) catch {};
+                                if (mux.getActivePane()) |pane| {
+                                    _ = pane.pty.write(key_buf[0..len]) catch {};
+                                }
                             }
                         }
                     } else {
                         // Fallback: raw keycode passthrough (no xkbcommon)
+                        if (prefix.awaiting) {
+                            prefix.reset();
+                            if (key.keycode < 128) {
+                                handleMuxCommand(@truncate(key.keycode), &mux, &graph, &running, allocator, grid_rows, grid_cols);
+                                continue;
+                            }
+                        }
                         if (key.keycode < 128) {
-                            const byte = [1]u8{@truncate(key.keycode)};
-                            _ = pty.write(&byte) catch {};
+                            if (mux.getActivePane()) |pane| {
+                                const byte = [1]u8{@truncate(key.keycode)};
+                                _ = pane.pty.write(&byte) catch {};
+                            }
                         }
                     }
                 },
@@ -145,22 +209,17 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
             }
         }
 
-        const n = posix.read(pty.master, &pty_buf) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => break,
-        };
-        if (n > 0) {
-            vt.feed(pty_buf[0..n]);
-            grid.dirty = true;
+        // Poll all PTYs
+        const had_output = mux.pollPtys(&pty_buf);
 
-            // Check for agent protocol events (OSC 9999)
-            if (vt.consumeAgentEvent()) |payload| {
-                if (protocol.parsePayload(payload)) |event| {
-                    // Update process graph with agent metadata
-                    switch (event.command) {
+        // Check for agent protocol events on all panes
+        for (mux.panes.items) |*pane| {
+            if (pane.vt.consumeAgentEvent()) |payload| {
+                if (protocol.parsePayload(payload)) |event_data| {
+                    switch (event_data.command) {
                         .start => {
                             _ = graph.spawn(.{
-                                .name = event.name orelse "agent",
+                                .name = event_data.name orelse "agent",
                                 .kind = .agent,
                                 .pid = null,
                             }) catch {};
@@ -171,17 +230,89 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
             }
         }
 
-        if (grid.dirty) {
-            renderer.render(&grid);
-            if (renderer.getFramebuffer()) |fb| {
-                const sz = win.getSize();
-                win.putFramebuffer(fb, sz.width, sz.height);
+        // Check if any pane's grid is dirty
+        var any_dirty = had_output;
+        if (!any_dirty) {
+            for (mux.panes.items) |*pane| {
+                if (pane.grid.dirty) {
+                    any_dirty = true;
+                    break;
+                }
             }
-            grid.dirty = false;
+        }
+
+        if (any_dirty) {
+            // Get the underlying SoftwareRenderer for multi-pane rendering
+            switch (renderer) {
+                .cpu => |*cpu| {
+                    const sz = win.getSize();
+                    mux.renderAll(cpu, sz.width, sz.height, atlas.cell_width, atlas.cell_height);
+                    win.putFramebuffer(cpu.getFramebuffer(), sz.width, sz.height);
+                },
+                .tty => {},
+            }
+            // Clear dirty flags
+            for (mux.panes.items) |*pane| {
+                pane.grid.dirty = false;
+            }
         } else {
             std.Thread.sleep(1_000_000); // 1ms idle
         }
     }
+}
+
+/// Handle a multiplexer command after the prefix key (Ctrl+Space).
+fn handleMuxCommand(
+    cmd: u8,
+    mux: *Multiplexer,
+    graph: *ProcessGraph,
+    running: *bool,
+    allocator: std.mem.Allocator,
+    grid_rows: u16,
+    grid_cols: u16,
+) void {
+    switch (cmd) {
+        'c' => {
+            // Spawn new pane
+            const id = mux.spawnPane(grid_rows, grid_cols) catch return;
+            if (mux.getPaneById(id)) |pane| {
+                _ = graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid }) catch {};
+            }
+        },
+        'x' => {
+            // Close active pane
+            if (mux.getActivePane()) |pane| {
+                const id = pane.id;
+                mux.closePane(id);
+                // If no panes left, exit
+                if (mux.panes.items.len == 0) {
+                    running.* = false;
+                }
+            }
+        },
+        'n' => mux.focusNext(),
+        'p' => mux.focusPrev(),
+        ' ' => mux.cycleLayout(),
+        'd' => {
+            // Detach: save session and exit
+            mux.saveSession(graph, "/tmp/teru-session.bin") catch {};
+            running.* = false;
+        },
+        '1'...'9' => {
+            // Switch workspace (1-based → 0-based)
+            mux.switchWorkspace(cmd - '1');
+        },
+        else => {
+            // Unknown command; forward the prefix + key to active pane
+            if (mux.getActivePane()) |pane| {
+                const nul = [1]u8{0}; // Ctrl+Space = NUL
+                _ = pane.pty.write(&nul) catch {};
+                const byte = [1]u8{cmd};
+                _ = pane.pty.write(&byte) catch {};
+            }
+        },
+    }
+    _ = allocator;
 }
 
 fn runRawMode(allocator: std.mem.Allocator) !void {

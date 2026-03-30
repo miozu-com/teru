@@ -1049,3 +1049,73 @@ test "SIMD fast-path — mixed text and escapes" {
     try std.testing.expectEqual(@as(u21, 'd'), grid.cellAtConst(0, 9).char);
     try std.testing.expect(grid.cellAtConst(0, 5).attrs.bold);
 }
+
+// ── Agent protocol (OSC 9999) tests ─────────────────────────────
+
+test "OSC 9999 agent event with BEL terminator" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // No agent event initially
+    try std.testing.expect(parser.consumeAgentEvent() == null);
+
+    // Feed an OSC 9999 sequence
+    parser.feed("\x1b]9999;agent:start;name=backend-dev\x07");
+
+    // Should have an agent event
+    const payload = parser.consumeAgentEvent() orelse return error.ExpectedAgentEvent;
+    try std.testing.expectEqualStrings("agent:start;name=backend-dev", payload);
+
+    // Second consume returns null (already consumed)
+    try std.testing.expect(parser.consumeAgentEvent() == null);
+}
+
+test "OSC 9999 agent event with ESC backslash terminator" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("\x1b]9999;agent:status;state=working;progress=0.5\x1b");
+
+    const payload = parser.consumeAgentEvent() orelse return error.ExpectedAgentEvent;
+    try std.testing.expectEqualStrings("agent:status;state=working;progress=0.5", payload);
+}
+
+test "OSC 9999 does not interfere with regular OSC title" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Regular title OSC
+    parser.feed("\x1b]0;My Title\x07");
+    try std.testing.expectEqualSlices(u8, "My Title", parser.title[0..parser.title_len]);
+    try std.testing.expect(parser.consumeAgentEvent() == null);
+
+    // Agent OSC — should not affect title
+    parser.feed("\x1b]9999;agent:start;name=test\x07");
+    try std.testing.expectEqualSlices(u8, "My Title", parser.title[0..parser.title_len]);
+    try std.testing.expect(parser.consumeAgentEvent() != null);
+}
+
+test "OSC 9999 interleaved with text" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Text, then agent event, then more text
+    parser.feed("Hello\x1b]9999;agent:task;task=Building\x07World");
+
+    // Text should be written to grid
+    try std.testing.expectEqual(@as(u21, 'H'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'o'), grid.cellAtConst(0, 4).char);
+    try std.testing.expectEqual(@as(u21, 'W'), grid.cellAtConst(0, 5).char);
+
+    // Agent event should be captured
+    const payload = parser.consumeAgentEvent() orelse return error.ExpectedAgentEvent;
+    try std.testing.expectEqualStrings("agent:task;task=Building", payload);
+}

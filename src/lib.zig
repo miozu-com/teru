@@ -19,6 +19,8 @@ pub const HookHandler = @import("agent/HookHandler.zig");
 pub const Terminal = @import("core/Terminal.zig");
 pub const Grid = @import("core/Grid.zig");
 pub const VtParser = @import("core/VtParser.zig");
+pub const Pane = @import("core/Pane.zig");
+pub const Multiplexer = @import("core/Multiplexer.zig");
 pub const Session = @import("persist/Session.zig");
 pub const Scrollback = @import("persist/Scrollback.zig");
 pub const LayoutEngine = @import("tiling/LayoutEngine.zig");
@@ -32,6 +34,8 @@ test {
     _ = Terminal;
     _ = Grid;
     _ = VtParser;
+    _ = Pane;
+    _ = Multiplexer;
     _ = Session;
     _ = Scrollback;
     _ = LayoutEngine;
