@@ -81,6 +81,7 @@ pub const SoftwareRenderer = struct {
     glyph_atlas: []const u8, // pre-rasterized glyph bitmaps (grayscale, row-major)
     atlas_width: u32,
     atlas_height: u32,
+    cursor_color: u32, // configurable cursor block color (ARGB)
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -89,6 +90,18 @@ pub const SoftwareRenderer = struct {
         height: u32,
         cell_width: u32,
         cell_height: u32,
+    ) !SoftwareRenderer {
+        return initWithCursor(allocator, width, height, cell_width, cell_height, 0xFFFF9922);
+    }
+
+    /// Init with a configurable cursor color (ARGB u32).
+    pub fn initWithCursor(
+        allocator: std.mem.Allocator,
+        width: u32,
+        height: u32,
+        cell_width: u32,
+        cell_height: u32,
+        cursor_color: u32,
     ) !SoftwareRenderer {
         const pixel_count = @as(usize, width) * @as(usize, height);
         const fb = try allocator.alloc(u32, pixel_count);
@@ -105,6 +118,7 @@ pub const SoftwareRenderer = struct {
             .glyph_atlas = &.{},
             .atlas_width = 0,
             .atlas_height = 0,
+            .cursor_color = cursor_color,
             .allocator = allocator,
         };
     }
@@ -183,7 +197,7 @@ pub const SoftwareRenderer = struct {
         if (grid.cursor_row < grid.rows and grid.cursor_col < grid.cols) {
             const cx: usize = @as(usize, grid.cursor_col) * cw;
             const cy: usize = @as(usize, grid.cursor_row) * ch;
-            const cursor_color: u32 = 0xFFFF9922; // orange (miozu accent)
+            const cursor_color: u32 = self.cursor_color;
 
             const cursor_max_y = @min(cy + ch, fb_h);
             const cursor_max_x = @min(cx + cw, fb_w);

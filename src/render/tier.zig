@@ -71,6 +71,10 @@ pub const Renderer = union(enum) {
         return .{ .cpu = try SoftwareRenderer.init(allocator, width, height, cell_width, cell_height) };
     }
 
+    pub fn initCpuWithCursor(allocator: std.mem.Allocator, width: u32, height: u32, cell_width: u32, cell_height: u32, cursor_color: u32) !Renderer {
+        return .{ .cpu = try SoftwareRenderer.initWithCursor(allocator, width, height, cell_width, cell_height, cursor_color) };
+    }
+
     pub fn initTty() Renderer {
         return .{ .tty = {} };
     }

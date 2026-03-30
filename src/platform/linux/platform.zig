@@ -23,6 +23,8 @@ const wayland = if (enable_wayland) @import("wayland.zig") else struct {
 
 const types = @import("../types.zig");
 pub const KeyEvent = types.KeyEvent;
+pub const MouseButton = types.MouseButton;
+pub const MouseEvent = types.MouseEvent;
 pub const Event = types.Event;
 pub const Size = types.Size;
 

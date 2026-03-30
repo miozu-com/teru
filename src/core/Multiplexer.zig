@@ -4,6 +4,7 @@ const Pane = @import("Pane.zig");
 const Grid = @import("Grid.zig");
 const LayoutEngine = @import("../tiling/LayoutEngine.zig");
 const Rect = LayoutEngine.Rect;
+const Selection = @import("Selection.zig");
 const SoftwareRenderer = @import("../render/software.zig").SoftwareRenderer;
 const Session = @import("../persist/Session.zig");
 const ProcessGraph = @import("../graph/ProcessGraph.zig");
@@ -146,6 +147,19 @@ pub fn renderAll(
     cell_width: u32,
     cell_height: u32,
 ) void {
+    self.renderAllWithSelection(renderer, screen_width, screen_height, cell_width, cell_height, null);
+}
+
+/// Render all visible panes with optional selection highlight on the active pane.
+pub fn renderAllWithSelection(
+    self: *Multiplexer,
+    renderer: *SoftwareRenderer,
+    screen_width: u32,
+    screen_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    sel: ?*const Selection,
+) void {
     const bg = resolveDefaultBg();
     @memset(renderer.framebuffer, bg);
 
@@ -171,6 +185,8 @@ pub fn renderAll(
 
         const pane = self.getPaneById(node_ids[i]) orelse continue;
         const is_active = if (active_id) |aid| aid == pane.id else false;
+        // Only apply selection highlight to the active pane
+        const pane_sel = if (is_active) sel else null;
 
         // For multi-pane layouts, reserve 1px border around each pane
         const has_border = node_ids.len > 1;
@@ -181,10 +197,10 @@ pub fn renderAll(
 
             // Render grid into inset rect
             const inset = insetRect(rect, 1);
-            renderPaneIntoRect(renderer, &pane.grid, inset, cell_width, cell_height, is_active);
+            renderPaneIntoRect(renderer, &pane.grid, inset, cell_width, cell_height, is_active, pane_sel);
         } else {
             // Single pane: no border, full screen
-            renderPaneIntoRect(renderer, &pane.grid, rect, cell_width, cell_height, is_active);
+            renderPaneIntoRect(renderer, &pane.grid, rect, cell_width, cell_height, is_active, pane_sel);
         }
     }
 }
@@ -197,6 +213,7 @@ fn renderPaneIntoRect(
     cell_width: u32,
     cell_height: u32,
     is_active: bool,
+    sel: ?*const Selection,
 ) void {
     const cols: usize = grid.cols;
     const rows: usize = grid.rows;
@@ -229,6 +246,15 @@ fn renderPaneIntoRect(
             }
             if (cell.attrs.dim) fg = dimColor(fg);
             if (cell.attrs.hidden) fg = bg;
+
+            // Selection highlight: swap fg/bg for selected cells
+            if (sel) |s| {
+                if (s.isSelected(@intCast(row), @intCast(col))) {
+                    const tmp = fg;
+                    fg = bg;
+                    bg = tmp;
+                }
+            }
 
             // Fill cell background
             const max_y = @min(screen_y + ch, fb_h, ry + rh);

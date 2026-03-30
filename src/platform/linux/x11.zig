@@ -8,6 +8,8 @@ const platform = @import("platform.zig");
 
 pub const Event = platform.Event;
 pub const KeyEvent = platform.KeyEvent;
+pub const MouseButton = platform.MouseButton;
+pub const MouseEvent = platform.MouseEvent;
 
 // ── XCB type declarations (replaces @cImport of xcb/xcb.h) ───────────
 
@@ -91,6 +93,11 @@ const xcb_key_press_event_t = extern struct {
 
 const xcb_key_release_event_t = xcb_key_press_event_t;
 
+// XCB button press/release and motion events share the same layout as key events
+const xcb_button_press_event_t = xcb_key_press_event_t;
+const xcb_button_release_event_t = xcb_key_press_event_t;
+const xcb_motion_notify_event_t = xcb_key_press_event_t;
+
 const xcb_client_message_event_t = extern struct {
     response_type: u8,
     format: u8,
@@ -125,6 +132,9 @@ const XCB_EVENT_MASK_STRUCTURE_NOTIFY: u32 = 0x20000;
 const XCB_EVENT_MASK_KEY_PRESS: u32 = 1;
 const XCB_EVENT_MASK_KEY_RELEASE: u32 = 2;
 const XCB_EVENT_MASK_FOCUS_CHANGE: u32 = 0x200000;
+const XCB_EVENT_MASK_BUTTON_PRESS: u32 = 0x4;
+const XCB_EVENT_MASK_BUTTON_RELEASE: u32 = 0x8;
+const XCB_EVENT_MASK_BUTTON_MOTION: u32 = 0x2000; // motion while any button held
 
 const XCB_PROP_MODE_REPLACE: u8 = 0;
 
@@ -133,6 +143,9 @@ const XCB_CONFIGURE_NOTIFY: u8 = 22;
 const XCB_KEY_PRESS: u8 = 2;
 const XCB_KEY_RELEASE: u8 = 3;
 const XCB_CLIENT_MESSAGE: u8 = 33;
+const XCB_BUTTON_PRESS: u8 = 4;
+const XCB_BUTTON_RELEASE: u8 = 5;
+const XCB_MOTION_NOTIFY: u8 = 6;
 const XCB_FOCUS_IN: u8 = 9;
 const XCB_FOCUS_OUT: u8 = 10;
 
@@ -205,7 +218,10 @@ pub const X11Window = struct {
             XCB_EVENT_MASK_STRUCTURE_NOTIFY |
             XCB_EVENT_MASK_KEY_PRESS |
             XCB_EVENT_MASK_KEY_RELEASE |
-            XCB_EVENT_MASK_FOCUS_CHANGE;
+            XCB_EVENT_MASK_FOCUS_CHANGE |
+            XCB_EVENT_MASK_BUTTON_PRESS |
+            XCB_EVENT_MASK_BUTTON_RELEASE |
+            XCB_EVENT_MASK_BUTTON_MOTION;
         const value_mask: u32 = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
         const value_list = [2]u32{ screen.black_pixel, event_mask };
 
@@ -281,6 +297,37 @@ pub const X11Window = struct {
                 const key: *const xcb_key_release_event_t = @ptrCast(@alignCast(raw_event));
                 return .{ .key_release = .{ .keycode = @intCast(key.detail), .modifiers = @intCast(key.state) } };
             },
+            XCB_BUTTON_PRESS => {
+                const btn: *const xcb_button_press_event_t = @ptrCast(@alignCast(raw_event));
+                const mouse_btn = xcbButtonToMouse(btn.detail);
+                if (mouse_btn) |mb| {
+                    return .{ .mouse_press = .{
+                        .x = @intCast(@max(0, btn.event_x)),
+                        .y = @intCast(@max(0, btn.event_y)),
+                        .button = mb,
+                    } };
+                }
+                return .none;
+            },
+            XCB_BUTTON_RELEASE => {
+                const btn: *const xcb_button_release_event_t = @ptrCast(@alignCast(raw_event));
+                const mouse_btn = xcbButtonToMouse(btn.detail);
+                if (mouse_btn) |mb| {
+                    return .{ .mouse_release = .{
+                        .x = @intCast(@max(0, btn.event_x)),
+                        .y = @intCast(@max(0, btn.event_y)),
+                        .button = mb,
+                    } };
+                }
+                return .none;
+            },
+            XCB_MOTION_NOTIFY => {
+                const motion: *const xcb_motion_notify_event_t = @ptrCast(@alignCast(raw_event));
+                return .{ .mouse_motion = .{
+                    .x = @intCast(@max(0, motion.event_x)),
+                    .y = @intCast(@max(0, motion.event_y)),
+                } };
+            },
             XCB_CLIENT_MESSAGE => {
                 const msg: *const xcb_client_message_event_t = @ptrCast(@alignCast(raw_event));
                 if (msg.data.data32[0] == self.wm_delete_window) {
@@ -311,6 +358,18 @@ pub const X11Window = struct {
         return .{ .width = self.width, .height = self.height };
     }
 };
+
+/// Map XCB button detail (1-5) to MouseButton.
+fn xcbButtonToMouse(detail: u8) ?MouseButton {
+    return switch (detail) {
+        1 => .left,
+        2 => .middle,
+        3 => .right,
+        4 => .scroll_up,
+        5 => .scroll_down,
+        else => null,
+    };
+}
 
 fn internAtom(conn: *xcb_connection_t, name: [*:0]const u8, only_if_exists: bool) xcb_atom_t {
     const name_len: u16 = @intCast(std.mem.len(name));

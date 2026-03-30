@@ -13,6 +13,9 @@ const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
 const protocol = @import("agent/protocol.zig");
 const build_options = @import("build_options");
+const Config = @import("config/Config.zig");
+const Hooks = @import("config/Hooks.zig");
+const Selection = @import("core/Selection.zig");
 const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
     @import("platform/linux/keyboard.zig").Keyboard
 else
@@ -84,32 +87,49 @@ const PrefixState = struct {
 };
 
 fn runWindowedMode(allocator: std.mem.Allocator) !void {
+    // Load configuration from ~/.config/teru/teru.conf (defaults if missing)
+    var config = try Config.load(allocator);
+    defer config.deinit();
+
     var graph = ProcessGraph.init(allocator);
     defer graph.deinit();
 
-    var win = try platform.Platform.init(960, 640, "teru");
+    var win = try platform.Platform.init(config.initial_width, config.initial_height, "teru");
     defer win.deinit();
 
-    var atlas = try render.FontAtlas.init(allocator, null, 16);
+    var atlas = try render.FontAtlas.init(allocator, config.font_path, config.font_size);
     defer atlas.deinit();
 
-    // CPU SIMD renderer — no GPU needed
-    var renderer = try render.tier.Renderer.initCpu(allocator, 960, 640, atlas.cell_width, atlas.cell_height);
+    // CPU SIMD renderer — no GPU needed (cursor color from config)
+    var renderer = try render.tier.Renderer.initCpuWithCursor(
+        allocator,
+        config.initial_width,
+        config.initial_height,
+        atlas.cell_width,
+        atlas.cell_height,
+        config.cursor_color,
+    );
     defer renderer.deinit();
     renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
 
-    const grid_cols: u16 = @intCast(960 / atlas.cell_width);
-    const grid_rows: u16 = @intCast(640 / atlas.cell_height);
+    const grid_cols: u16 = @intCast(config.initial_width / atlas.cell_width);
+    const grid_rows: u16 = @intCast(config.initial_height / atlas.cell_height);
 
     // Multiplexer: manages all panes
     var mux = Multiplexer.init(allocator);
     defer mux.deinit();
+
+    // Plugin hooks: external commands fired on terminal events
+    var hooks = Hooks.init(allocator);
+    defer hooks.deinit();
+    loadHooks(&config, &hooks);
 
     // Spawn initial pane
     const initial_id = try mux.spawnPane(grid_rows, grid_cols);
     if (mux.getPaneById(initial_id)) |pane| {
         _ = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid });
     }
+    hooks.fire(.spawn);
 
     // Keyboard input: xkbcommon translates XCB keycodes → UTF-8
     var keyboard = if (Keyboard != void)
@@ -121,6 +141,10 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     };
 
     var prefix = PrefixState{};
+    var selection = Selection{};
+    _ = &selection;
+    var mouse_down = false;
+    _ = &mouse_down;
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
@@ -167,7 +191,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                             if (prefix.awaiting) {
                                 prefix.reset();
                                 if (len > 0) {
-                                    handleMuxCommand(key_buf[0], &mux, &graph, &running, allocator, grid_rows, grid_cols);
+                                    handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, allocator, grid_rows, grid_cols);
                                     continue;
                                 }
                             }
@@ -184,7 +208,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         if (prefix.awaiting) {
                             prefix.reset();
                             if (key.keycode < 128) {
-                                handleMuxCommand(@truncate(key.keycode), &mux, &graph, &running, allocator, grid_rows, grid_cols);
+                                handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, allocator, grid_rows, grid_cols);
                                 continue;
                             }
                         }
@@ -202,6 +226,60 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         if (keyboard) |*kb| {
                             var dummy: [1]u8 = undefined;
                             _ = kb.processKey(key.keycode, false, &dummy);
+                        }
+                    }
+                },
+                .mouse_press => |mouse| {
+                    switch (mouse.button) {
+                        .left => {
+                            // Start text selection
+                            const col: u16 = @intCast(mouse.x / atlas.cell_width);
+                            const row: u16 = @intCast(mouse.y / atlas.cell_height);
+                            selection.clear();
+                            selection.begin(row, col);
+                            mouse_down = true;
+                        },
+                        .middle => {
+                            // Paste from clipboard
+                            if (mux.getActivePane()) |pane| {
+                                pasteFromClipboard(&pane.pty);
+                            }
+                        },
+                        .scroll_up => {
+                            // Scroll up (future: scrollback navigation)
+                        },
+                        .scroll_down => {
+                            // Scroll down (future: scrollback navigation)
+                        },
+                        else => {},
+                    }
+                },
+                .mouse_release => |mouse| {
+                    if (mouse.button == .left and mouse_down) {
+                        mouse_down = false;
+                        const col: u16 = @intCast(mouse.x / atlas.cell_width);
+                        const row: u16 = @intCast(mouse.y / atlas.cell_height);
+                        selection.update(row, col);
+                        selection.finish();
+
+                        // Copy selected text to clipboard
+                        if (mux.getActivePane()) |pane| {
+                            var sel_buf: [8192]u8 = undefined;
+                            const len = selection.getText(&pane.grid, &sel_buf);
+                            if (len > 0) {
+                                copyToClipboard(sel_buf[0..len]);
+                            }
+                        }
+                    }
+                },
+                .mouse_motion => |motion| {
+                    if (mouse_down) {
+                        const col: u16 = @intCast(motion.x / atlas.cell_width);
+                        const row: u16 = @intCast(motion.y / atlas.cell_height);
+                        selection.update(row, col);
+                        // Mark grid dirty so selection highlight redraws
+                        if (mux.getActivePane()) |pane| {
+                            pane.grid.dirty = true;
                         }
                     }
                 },
@@ -223,6 +301,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                                 .kind = .agent,
                                 .pid = null,
                             }) catch {};
+                            hooks.fire(.agent_start);
                         },
                         else => {},
                     }
@@ -246,7 +325,8 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
             switch (renderer) {
                 .cpu => |*cpu| {
                     const sz = win.getSize();
-                    mux.renderAll(cpu, sz.width, sz.height, atlas.cell_width, atlas.cell_height);
+                    const sel_ptr: ?*const Selection = if (selection.active) &selection else null;
+                    mux.renderAllWithSelection(cpu, sz.width, sz.height, atlas.cell_width, atlas.cell_height, sel_ptr);
                     win.putFramebuffer(cpu.getFramebuffer(), sz.width, sz.height);
                 },
                 .tty => {},
@@ -261,11 +341,20 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     }
 }
 
+/// Transfer hook commands from Config into the Hooks struct.
+fn loadHooks(config: *const Config, hooks: *Hooks) void {
+    if (config.hook_on_spawn) |cmd| hooks.setHook(.spawn, cmd);
+    if (config.hook_on_close) |cmd| hooks.setHook(.close, cmd);
+    if (config.hook_on_agent_start) |cmd| hooks.setHook(.agent_start, cmd);
+    if (config.hook_on_session_save) |cmd| hooks.setHook(.session_save, cmd);
+}
+
 /// Handle a multiplexer command after the prefix key (Ctrl+Space).
 fn handleMuxCommand(
     cmd: u8,
     mux: *Multiplexer,
     graph: *ProcessGraph,
+    hooks: *const Hooks,
     running: *bool,
     allocator: std.mem.Allocator,
     grid_rows: u16,
@@ -278,12 +367,14 @@ fn handleMuxCommand(
             if (mux.getPaneById(id)) |pane| {
                 _ = graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid }) catch {};
             }
+            hooks.fire(.spawn);
         },
         'x' => {
             // Close active pane
             if (mux.getActivePane()) |pane| {
                 const id = pane.id;
                 mux.closePane(id);
+                hooks.fire(.close);
                 // If no panes left, exit
                 if (mux.panes.items.len == 0) {
                     running.* = false;
@@ -296,6 +387,7 @@ fn handleMuxCommand(
         'd' => {
             // Detach: save session and exit
             mux.saveSession(graph, "/tmp/teru-session.bin") catch {};
+            hooks.fire(.session_save);
             running.* = false;
         },
         '1'...'9' => {
@@ -313,6 +405,92 @@ fn handleMuxCommand(
         },
     }
     _ = allocator;
+}
+
+// ── Clipboard (xclip) ────────────────────────────────────────────
+
+/// Copy text to the system clipboard via xclip (fork + exec).
+fn copyToClipboard(text: []const u8) void {
+    // Create a pipe so we can write text to xclip's stdin
+    const pipe_fds = posix.pipe2(.{}) catch return;
+    const read_end = pipe_fds[0];
+    const write_end = pipe_fds[1];
+
+    const pid = posix.fork() catch {
+        posix.close(read_end);
+        posix.close(write_end);
+        return;
+    };
+
+    if (pid == 0) {
+        // Child: redirect stdin to read end of pipe
+        posix.close(write_end);
+        posix.dup2(read_end, posix.STDIN_FILENO) catch posix.exit(1);
+        posix.close(read_end);
+
+        const argv = [_:null]?[*:0]const u8{
+            "xclip",
+            "-selection",
+            "clipboard",
+        };
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        posix.execveZ("/usr/bin/xclip", &argv, envp) catch {};
+        // If xclip not at /usr/bin, try PATH
+        posix.execvpeZ("xclip", &argv, envp) catch {};
+        posix.exit(1);
+    }
+
+    // Parent: write text to pipe, then close
+    posix.close(read_end);
+    _ = posix.write(write_end, text) catch {};
+    posix.close(write_end);
+    // Fire-and-forget — don't waitpid (SIGCHLD ignored)
+}
+
+/// Paste from the system clipboard via xclip, writing output to the PTY.
+fn pasteFromClipboard(pty: *const Pty) void {
+    // Create a pipe so we can read xclip's stdout
+    const pipe_fds = posix.pipe2(.{}) catch return;
+    const read_end = pipe_fds[0];
+    const write_end = pipe_fds[1];
+
+    const pid = posix.fork() catch {
+        posix.close(read_end);
+        posix.close(write_end);
+        return;
+    };
+
+    if (pid == 0) {
+        // Child: redirect stdout to write end of pipe
+        posix.close(read_end);
+        posix.dup2(write_end, posix.STDOUT_FILENO) catch posix.exit(1);
+        posix.close(write_end);
+
+        const argv = [_:null]?[*:0]const u8{
+            "xclip",
+            "-selection",
+            "clipboard",
+            "-o",
+        };
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        posix.execveZ("/usr/bin/xclip", &argv, envp) catch {};
+        posix.execvpeZ("xclip", &argv, envp) catch {};
+        posix.exit(1);
+    }
+
+    // Parent: read from pipe and write to PTY
+    posix.close(write_end);
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = posix.read(read_end, &buf) catch break;
+        if (n == 0) break;
+        _ = pty.write(buf[0..n]) catch break;
+    }
+    posix.close(read_end);
+
+    // Reap the child
+    _ = posix.waitpid(pid, 0);
 }
 
 fn runRawMode(allocator: std.mem.Allocator) !void {

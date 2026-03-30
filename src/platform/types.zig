@@ -9,9 +9,20 @@ pub const KeyEvent = struct {
     modifiers: u32,
 };
 
+pub const MouseButton = enum { left, middle, right, scroll_up, scroll_down };
+
+pub const MouseEvent = struct {
+    x: u32, // pixel x
+    y: u32, // pixel y
+    button: MouseButton,
+};
+
 pub const Event = union(enum) {
     key_press: KeyEvent,
     key_release: KeyEvent,
+    mouse_press: MouseEvent,
+    mouse_release: MouseEvent,
+    mouse_motion: struct { x: u32, y: u32 },
     resize: struct { width: u32, height: u32 },
     close,
     focus_in,
