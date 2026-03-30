@@ -71,17 +71,28 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     var atlas = try render.FontAtlas.init(allocator, null, 16);
     defer atlas.deinit();
 
-    // Initialize OpenGL renderer
-    var renderer = try render.Renderer.init(
-        allocator,
-        960,
-        640,
-        &getProcAddr,
-    );
-    defer renderer.deinit();
-
-    // Upload font atlas texture
-    renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
+    // Detect rendering tier and initialize appropriate renderer
+    const tier = render.detectTier();
+    var renderer: render.Renderer = switch (tier) {
+        .gpu => gpu: {
+            var gpu_renderer = try render.GpuRenderer.init(allocator, 960, 640, &getProcAddr);
+            gpu_renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
+            break :gpu .{ .gpu = .{
+                .ptr = @ptrCast(&gpu_renderer),
+                .render_fn = @ptrCast(&render.GpuRenderer.render),
+                .resize_fn = @ptrCast(&render.GpuRenderer.resize),
+                .update_atlas_fn = @ptrCast(&render.GpuRenderer.updateAtlas),
+                .deinit_fn = @ptrCast(&render.GpuRenderer.deinit),
+            } };
+        },
+        .cpu => cpu: {
+            var cpu_renderer = try render.SoftwareRenderer.init(allocator, 960, 640, atlas.cell_width, atlas.cell_height);
+            cpu_renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
+            break :cpu .{ .cpu = cpu_renderer };
+        },
+        .tty => .{ .tty = {} },
+    };
+    _ = &renderer;
 
     // Calculate grid dimensions from window size and cell size
     const grid_cols: u16 = @intCast(960 / atlas.cell_width);

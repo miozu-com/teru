@@ -20,6 +20,7 @@ pub const Terminal = @import("core/Terminal.zig");
 pub const Grid = @import("core/Grid.zig");
 pub const VtParser = @import("core/VtParser.zig");
 pub const Session = @import("persist/Session.zig");
+pub const Scrollback = @import("persist/Scrollback.zig");
 pub const LayoutEngine = @import("tiling/LayoutEngine.zig");
 pub const render = @import("render/render.zig");
 
@@ -32,6 +33,7 @@ test {
     _ = Grid;
     _ = VtParser;
     _ = Session;
+    _ = Scrollback;
     _ = LayoutEngine;
     _ = render;
 }
