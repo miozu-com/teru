@@ -69,6 +69,19 @@ pub fn spawn(opts: SpawnOptions) !Pty {
         // Set window size on the slave side (via stdin which now points to the PTY)
         _ = posix.system.ioctl(posix.STDIN_FILENO, posix.T.IOCSWINSZ, @intFromPtr(&ws));
 
+        // Disable ECHO on the slave PTY. Without this, bytes written to
+        // the master fd (like DA1 responses) get echoed back to master by
+        // the PTY layer, causing the terminal to render response bytes as text.
+        // The shell (fish/bash/zsh) sets its own termios on startup.
+        if (posix.tcgetattr(posix.STDIN_FILENO)) |attrs| {
+            var child_termios = attrs;
+            child_termios.lflag.ECHO = false;
+            child_termios.lflag.ECHOE = false;
+            child_termios.lflag.ECHOK = false;
+            child_termios.lflag.ECHONL = false;
+            posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, child_termios) catch {};
+        } else |_| {}
+
         // Set environment
         setChildEnv(opts.cols, opts.rows);
 

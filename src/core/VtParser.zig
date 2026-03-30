@@ -72,15 +72,12 @@ pub fn init(grid: *Grid) VtParser {
 }
 
 /// Send a response back to the PTY (for DA1, DSR, etc.)
-/// DISABLED: responses via PTY master write are being interpreted by
-/// fish as shell input commands, causing "teru" garbage on screen.
-/// TODO: investigate proper response delivery mechanism.
+/// Writes to the PTY master fd — the shell reads this from stdin.
+/// PTY slave ECHO must be off (set in Pty.spawn) to prevent echo-back.
 fn sendResponse(self: *const VtParser, data: []const u8) void {
-    _ = self;
-    _ = data;
-    // Intentionally disabled — fish treats PTY master writes as typed input,
-    // not terminal query responses. The DA1 warning is cosmetic; the garbage
-    // text from incorrect response delivery is worse.
+    if (self.response_fd >= 0) {
+        _ = std.c.write(self.response_fd, data.ptr, data.len);
+    }
 }
 
 /// Create a VtParser with an undefined grid pointer.
