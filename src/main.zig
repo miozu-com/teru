@@ -142,13 +142,12 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Early PTY reads to catch shell startup queries (DA1, DSR, XTGETTCAP).
-    // The VtParser responds to ESC[c with ESC[?62;22c via response_fd.
-    // Must happen after linkVt() so response_fd is set.
+    // Early PTY reads: poll for 200ms to catch shell startup queries.
+    // Fish sends prompt output FIRST, then DA1 query. DO NOT break early —
+    // keep reading the full window to process the entire startup sequence.
     if (mux.getActivePane()) |pane| {
         for (0..20) |_| {
-            const n = pane.readAndProcess(&pty_buf) catch 0;
-            if (n > 0) break; // Got data — responses are being sent
+            _ = pane.readAndProcess(&pty_buf) catch {};
             io.sleep(.fromMilliseconds(10), .awake) catch {};
         }
     }
