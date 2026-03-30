@@ -338,98 +338,6 @@ pub fn getSessionDir(allocator: Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/.local/state/teru/sessions", .{home});
 }
 
-// ── JSON export ─────────────────────────────────────────────────
-
-/// Export the graph as JSON into the provided buffer. Returns the
-/// written slice. Intended for debugging and MCP integration.
-pub fn toJson(graph: *const ProcessGraph, buf: []u8) ![]const u8 {
-    var stream = std.io.fixedBufferStream(buf);
-    const writer = stream.writer();
-
-    try writer.writeAll("{\"nodes\":[");
-
-    var it = graph.nodes.iterator();
-    var first = true;
-    while (it.next()) |entry| {
-        const node = entry.value_ptr;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try writeNodeJson(node, writer);
-    }
-
-    try writer.writeAll("],\"node_count\":");
-    try writer.print("{d}", .{graph.nodeCount()});
-    try writer.writeByte('}');
-
-    return stream.getWritten();
-}
-
-fn writeNodeJson(node: *const ProcessGraph.Node, writer: anytype) !void {
-    try writer.writeAll("{\"id\":");
-    try writer.print("{d}", .{node.id});
-
-    try writer.writeAll(",\"name\":\"");
-    try writeJsonEscaped(node.name, writer);
-
-    try writer.writeAll("\",\"kind\":\"");
-    try writer.writeAll(@tagName(node.kind));
-
-    try writer.writeAll("\",\"state\":\"");
-    try writer.writeAll(@tagName(node.state));
-
-    try writer.writeAll("\",\"workspace\":");
-    try writer.print("{d}", .{node.workspace});
-
-    // parent
-    if (node.parent) |parent_id| {
-        try writer.writeAll(",\"parent\":");
-        try writer.print("{d}", .{parent_id});
-    }
-
-    // pid
-    if (node.pid) |pid| {
-        try writer.writeAll(",\"pid\":");
-        try writer.print("{d}", .{pid});
-    }
-
-    // exit_code
-    if (node.exit_code) |code| {
-        try writer.writeAll(",\"exit_code\":");
-        try writer.print("{d}", .{code});
-    }
-
-    // agent metadata
-    if (node.agent) |agent| {
-        try writer.writeAll(",\"agent\":{\"group\":\"");
-        try writeJsonEscaped(agent.group, writer);
-        try writer.writeAll("\",\"role\":\"");
-        try writeJsonEscaped(agent.role, writer);
-        try writer.writeAll("\"}");
-    }
-
-    try writer.writeByte('}');
-}
-
-/// Write a string with JSON special characters escaped.
-fn writeJsonEscaped(s: []const u8, writer: anytype) !void {
-    for (s) |byte| {
-        switch (byte) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => |b| {
-                if (b < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{b});
-                } else {
-                    try writer.writeByte(b);
-                }
-            },
-        }
-    }
-}
-
 // ── Cleanup ─────────────────────────────────────────────────────
 
 pub fn deinit(self: *Session) void {
@@ -580,33 +488,6 @@ test "agent metadata round-trip" {
     const sn = session.graph_snapshot[0];
     try std.testing.expectEqualStrings("team-qa", sn.agent_group.?);
     try std.testing.expectEqualStrings("auditor", sn.agent_role.?);
-}
-
-test "toJson produces valid output" {
-    const allocator = std.testing.allocator;
-    var graph = ProcessGraph.init(allocator);
-    defer graph.deinit();
-
-    _ = try graph.spawn(.{ .name = "zsh", .pid = 100 });
-    _ = try graph.spawn(.{
-        .name = "agent-1",
-        .kind = .agent,
-        .agent = .{ .group = "ops", .role = "runner" },
-    });
-
-    var buf: [4096]u8 = undefined;
-    const json = try toJson(&graph, &buf);
-
-    // Basic structural checks
-    try std.testing.expect(std.mem.startsWith(u8, json, "{\"nodes\":["));
-    try std.testing.expect(std.mem.endsWith(u8, json, "}"));
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"node_count\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"zsh\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"agent-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"shell\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"agent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ops\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"runner\"") != null);
 }
 
 test "file save and load round-trip" {

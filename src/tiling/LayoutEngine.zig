@@ -329,700 +329,474 @@ pub fn autoSelectLayout(node_count: usize) Layout {
 
 // ── Tests ───────────────────────────────────────────────────────
 
+const t = std.testing;
+
+fn testEngine() struct { engine: LayoutEngine, allocator: Allocator } {
+    const a = t.allocator;
+    return .{ .engine = LayoutEngine.init(a), .allocator = a };
+}
+
 test "autoSelectLayout" {
-    try std.testing.expectEqual(Layout.monocle, autoSelectLayout(0));
-    try std.testing.expectEqual(Layout.monocle, autoSelectLayout(1));
-    try std.testing.expectEqual(Layout.master_stack, autoSelectLayout(2));
-    try std.testing.expectEqual(Layout.master_stack, autoSelectLayout(3));
-    try std.testing.expectEqual(Layout.master_stack, autoSelectLayout(4));
-    try std.testing.expectEqual(Layout.grid, autoSelectLayout(5));
-    try std.testing.expectEqual(Layout.grid, autoSelectLayout(9));
+    try t.expectEqual(Layout.monocle, autoSelectLayout(0));
+    try t.expectEqual(Layout.monocle, autoSelectLayout(1));
+    try t.expectEqual(Layout.master_stack, autoSelectLayout(2));
+    try t.expectEqual(Layout.master_stack, autoSelectLayout(3));
+    try t.expectEqual(Layout.master_stack, autoSelectLayout(4));
+    try t.expectEqual(Layout.grid, autoSelectLayout(5));
+    try t.expectEqual(Layout.grid, autoSelectLayout(9));
 }
 
 test "gridCols" {
-    try std.testing.expectEqual(@as(usize, 1), gridCols(1));
-    try std.testing.expectEqual(@as(usize, 2), gridCols(2));
-    try std.testing.expectEqual(@as(usize, 2), gridCols(3));
-    try std.testing.expectEqual(@as(usize, 2), gridCols(4));
-    try std.testing.expectEqual(@as(usize, 3), gridCols(5));
-    try std.testing.expectEqual(@as(usize, 3), gridCols(6));
-    try std.testing.expectEqual(@as(usize, 3), gridCols(9));
-    try std.testing.expectEqual(@as(usize, 4), gridCols(10));
+    try t.expectEqual(@as(usize, 1), gridCols(1));
+    try t.expectEqual(@as(usize, 2), gridCols(2));
+    try t.expectEqual(@as(usize, 2), gridCols(3));
+    try t.expectEqual(@as(usize, 2), gridCols(4));
+    try t.expectEqual(@as(usize, 3), gridCols(5));
+    try t.expectEqual(@as(usize, 3), gridCols(6));
+    try t.expectEqual(@as(usize, 3), gridCols(9));
+    try t.expectEqual(@as(usize, 4), gridCols(10));
 }
 
-test "master_stack layout — single node gets full screen" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try engine.workspaces[0].addNode(allocator, 100);
-    engine.workspaces[0].layout = .master_stack;
-
+test "single node gets full screen in master_stack and grid" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 1);
     const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
 
-    try std.testing.expectEqual(@as(usize, 1), rects.len);
-    try std.testing.expect(rects[0].eql(screen));
+    ws.layout = .master_stack;
+    const r1 = try s.engine.calculate(0, screen);
+    defer s.allocator.free(r1);
+    try t.expectEqual(@as(usize, 1), r1.len);
+    try t.expect(r1[0].eql(screen));
+
+    ws.layout = .grid;
+    const r2 = try s.engine.calculate(0, screen);
+    defer s.allocator.free(r2);
+    try t.expect(r2[0].eql(screen));
 }
 
-test "master_stack layout — two nodes" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "master_stack — two nodes" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 1);
+    try ws.addNode(s.allocator, 2);
+    ws.layout = .master_stack;
 
-    try engine.workspaces[0].addNode(allocator, 1);
-    try engine.workspaces[0].addNode(allocator, 2);
-    engine.workspaces[0].layout = .master_stack;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 1000, .height = 800 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 2), rects.len);
-
-    // Master: left 60%
-    try std.testing.expectEqual(@as(u16, 0), rects[0].x);
-    try std.testing.expectEqual(@as(u16, 600), rects[0].width);
-    try std.testing.expectEqual(@as(u16, 800), rects[0].height);
-
-    // Stack: right 40%, full height
-    try std.testing.expectEqual(@as(u16, 600), rects[1].x);
-    try std.testing.expectEqual(@as(u16, 400), rects[1].width);
-    try std.testing.expectEqual(@as(u16, 800), rects[1].height);
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 1000, .height = 800 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 2), rects.len);
+    try t.expectEqual(@as(u16, 0), rects[0].x);
+    try t.expectEqual(@as(u16, 600), rects[0].width);
+    try t.expectEqual(@as(u16, 800), rects[0].height);
+    try t.expectEqual(@as(u16, 600), rects[1].x);
+    try t.expectEqual(@as(u16, 400), rects[1].width);
+    try t.expectEqual(@as(u16, 800), rects[1].height);
 }
 
-test "master_stack layout — four nodes" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "master_stack — four nodes" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..5) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .master_stack;
+    ws.master_ratio = 0.5;
 
-    for (1..5) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .master_stack;
-    engine.workspaces[0].master_ratio = 0.5;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 1200, .height = 900 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 4), rects.len);
-
-    // Master
-    try std.testing.expectEqual(@as(u16, 600), rects[0].width);
-    try std.testing.expectEqual(@as(u16, 900), rects[0].height);
-
-    // 3 stack panes, each 300px tall
-    try std.testing.expectEqual(@as(u16, 600), rects[1].x);
-    try std.testing.expectEqual(@as(u16, 0), rects[1].y);
-    try std.testing.expectEqual(@as(u16, 300), rects[1].height);
-
-    try std.testing.expectEqual(@as(u16, 600), rects[2].x);
-    try std.testing.expectEqual(@as(u16, 300), rects[2].y);
-    try std.testing.expectEqual(@as(u16, 300), rects[2].height);
-
-    try std.testing.expectEqual(@as(u16, 600), rects[3].x);
-    try std.testing.expectEqual(@as(u16, 600), rects[3].y);
-    try std.testing.expectEqual(@as(u16, 300), rects[3].height);
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 1200, .height = 900 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 4), rects.len);
+    try t.expectEqual(@as(u16, 600), rects[0].width);
+    try t.expectEqual(@as(u16, 900), rects[0].height);
+    try t.expectEqual(@as(u16, 600), rects[1].x);
+    try t.expectEqual(@as(u16, 0), rects[1].y);
+    try t.expectEqual(@as(u16, 300), rects[1].height);
+    try t.expectEqual(@as(u16, 600), rects[2].x);
+    try t.expectEqual(@as(u16, 300), rects[2].y);
+    try t.expectEqual(@as(u16, 300), rects[2].height);
+    try t.expectEqual(@as(u16, 600), rects[3].x);
+    try t.expectEqual(@as(u16, 600), rects[3].y);
+    try t.expectEqual(@as(u16, 300), rects[3].height);
 }
 
-test "grid layout — four nodes" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "master_stack — offset origin and remainder height" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 1);
+    try ws.addNode(s.allocator, 2);
+    ws.layout = .master_stack;
+    ws.master_ratio = 0.5;
 
-    for (1..5) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .grid;
+    // Offset origin
+    const r1 = try s.engine.calculate(0, .{ .x = 10, .y = 20, .width = 800, .height = 600 });
+    defer s.allocator.free(r1);
+    try t.expectEqual(@as(u16, 10), r1[0].x);
+    try t.expectEqual(@as(u16, 20), r1[0].y);
+    try t.expectEqual(@as(u16, 400), r1[0].width);
+    try t.expectEqual(@as(u16, 410), r1[1].x);
+    try t.expectEqual(@as(u16, 20), r1[1].y);
+    try t.expectEqual(@as(u16, 400), r1[1].width);
 
-    const screen = Rect{ .x = 0, .y = 0, .width = 1000, .height = 800 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 4), rects.len);
-
-    // 2x2 grid, each cell 500x400
-    try std.testing.expect(rects[0].eql(.{ .x = 0, .y = 0, .width = 500, .height = 400 }));
-    try std.testing.expect(rects[1].eql(.{ .x = 500, .y = 0, .width = 500, .height = 400 }));
-    try std.testing.expect(rects[2].eql(.{ .x = 0, .y = 400, .width = 500, .height = 400 }));
-    try std.testing.expect(rects[3].eql(.{ .x = 500, .y = 400, .width = 500, .height = 400 }));
+    // Remainder: 3 nodes, height=101, 2 stack panes
+    try ws.addNode(s.allocator, 3);
+    ws.layout = .master_stack;
+    const r2 = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 100, .height = 101 });
+    defer s.allocator.free(r2);
+    try t.expectEqual(@as(u16, 50), r2[1].height);
+    try t.expectEqual(@as(u16, 51), r2[2].height);
+    try t.expectEqual(@as(u16, 0), r2[1].y);
+    try t.expectEqual(@as(u16, 50), r2[2].y);
 }
 
-test "grid layout — six nodes (3x2)" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "grid — four nodes (2x2)" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..5) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .grid;
 
-    for (1..7) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .grid;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 900, .height = 600 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 6), rects.len);
-
-    // 3 cols x 2 rows = 300x300 each
-    try std.testing.expectEqual(@as(u16, 300), rects[0].width);
-    try std.testing.expectEqual(@as(u16, 300), rects[0].height);
-    try std.testing.expectEqual(@as(u16, 0), rects[0].x);
-    try std.testing.expectEqual(@as(u16, 0), rects[0].y);
-
-    // Node 3 (index 2) = col 2, row 0
-    try std.testing.expectEqual(@as(u16, 600), rects[2].x);
-    try std.testing.expectEqual(@as(u16, 0), rects[2].y);
-
-    // Node 4 (index 3) = col 0, row 1
-    try std.testing.expectEqual(@as(u16, 0), rects[3].x);
-    try std.testing.expectEqual(@as(u16, 300), rects[3].y);
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 1000, .height = 800 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 4), rects.len);
+    try t.expect(rects[0].eql(.{ .x = 0, .y = 0, .width = 500, .height = 400 }));
+    try t.expect(rects[1].eql(.{ .x = 500, .y = 0, .width = 500, .height = 400 }));
+    try t.expect(rects[2].eql(.{ .x = 0, .y = 400, .width = 500, .height = 400 }));
+    try t.expect(rects[3].eql(.{ .x = 500, .y = 400, .width = 500, .height = 400 }));
 }
 
-test "grid layout — remainder pixels go to last col/row" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "grid — six nodes (3x2)" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..7) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .grid;
 
-    for (1..5) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .grid;
-
-    // 1001 / 2 = 500 base + 1 remainder, 801 / 2 = 400 base + 1 remainder
-    const screen = Rect{ .x = 0, .y = 0, .width = 1001, .height = 801 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    // Top-left: no extra
-    try std.testing.expectEqual(@as(u16, 500), rects[0].width);
-    try std.testing.expectEqual(@as(u16, 400), rects[0].height);
-
-    // Top-right: extra width pixel
-    try std.testing.expectEqual(@as(u16, 501), rects[1].width);
-    try std.testing.expectEqual(@as(u16, 400), rects[1].height);
-
-    // Bottom-left: extra height pixel
-    try std.testing.expectEqual(@as(u16, 500), rects[2].width);
-    try std.testing.expectEqual(@as(u16, 401), rects[2].height);
-
-    // Bottom-right: extra both
-    try std.testing.expectEqual(@as(u16, 501), rects[3].width);
-    try std.testing.expectEqual(@as(u16, 401), rects[3].height);
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 900, .height = 600 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 6), rects.len);
+    try t.expectEqual(@as(u16, 300), rects[0].width);
+    try t.expectEqual(@as(u16, 300), rects[0].height);
+    try t.expectEqual(@as(u16, 0), rects[0].x);
+    try t.expectEqual(@as(u16, 0), rects[0].y);
+    try t.expectEqual(@as(u16, 600), rects[2].x);
+    try t.expectEqual(@as(u16, 0), rects[2].y);
+    try t.expectEqual(@as(u16, 0), rects[3].x);
+    try t.expectEqual(@as(u16, 300), rects[3].y);
 }
 
-test "monocle layout — active node gets full screen" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "grid — five nodes (3x2, sparse last row)" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..6) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .grid;
 
-    for (1..4) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .monocle;
-    engine.workspaces[0].active_index = 1;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 3), rects.len);
-    try std.testing.expect(rects[0].eql(Rect.zero));
-    try std.testing.expect(rects[1].eql(screen));
-    try std.testing.expect(rects[2].eql(Rect.zero));
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 900, .height = 600 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 5), rects.len);
+    try t.expectEqual(@as(u16, 0), rects[0].x);
+    try t.expectEqual(@as(u16, 300), rects[1].x);
+    try t.expectEqual(@as(u16, 600), rects[2].x);
+    try t.expectEqual(@as(u16, 0), rects[3].x);
+    try t.expectEqual(@as(u16, 300), rects[3].y);
+    try t.expectEqual(@as(u16, 300), rects[4].x);
+    try t.expectEqual(@as(u16, 300), rects[4].y);
 }
 
-test "floating layout — cascading default positions" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "grid — remainder pixels go to last col/row" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..5) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .grid;
 
-    for (1..4) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .floating;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 800, .height = 600 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 3), rects.len);
-
-    // First window: no offset
-    try std.testing.expectEqual(@as(u16, 0), rects[0].x);
-    try std.testing.expectEqual(@as(u16, 0), rects[0].y);
-    try std.testing.expectEqual(@as(u16, 600), rects[0].width);
-    try std.testing.expectEqual(@as(u16, 450), rects[0].height);
-
-    // Second window: offset by 2
-    try std.testing.expectEqual(@as(u16, 2), rects[1].x);
-    try std.testing.expectEqual(@as(u16, 2), rects[1].y);
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 1001, .height = 801 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(u16, 500), rects[0].width);
+    try t.expectEqual(@as(u16, 400), rects[0].height);
+    try t.expectEqual(@as(u16, 501), rects[1].width);
+    try t.expectEqual(@as(u16, 400), rects[1].height);
+    try t.expectEqual(@as(u16, 500), rects[2].width);
+    try t.expectEqual(@as(u16, 401), rects[2].height);
+    try t.expectEqual(@as(u16, 501), rects[3].width);
+    try t.expectEqual(@as(u16, 401), rects[3].height);
 }
 
-test "calculate — zero nodes returns empty slice" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "monocle — active node gets full screen, focus switching" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 1);
+    try ws.addNode(s.allocator, 2);
+    try ws.addNode(s.allocator, 3);
+    ws.layout = .monocle;
+    ws.active_index = 1;
 
-    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
+    const screen: Rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const r1 = try s.engine.calculate(0, screen);
+    defer s.allocator.free(r1);
+    try t.expectEqual(@as(usize, 3), r1.len);
+    try t.expect(r1[0].eql(Rect.zero));
+    try t.expect(r1[1].eql(screen));
+    try t.expect(r1[2].eql(Rect.zero));
 
-    try std.testing.expectEqual(@as(usize, 0), rects.len);
+    // Switch focus
+    ws.active_index = 0;
+    const r2 = try s.engine.calculate(0, screen);
+    defer s.allocator.free(r2);
+    try t.expect(r2[0].eql(screen));
+    try t.expect(r2[1].eql(Rect.zero));
 }
 
-test "calculate — invalid workspace returns error" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "floating — cascading default positions" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    for (1..4) |id| try ws.addNode(s.allocator, @intCast(id));
+    ws.layout = .floating;
 
-    const screen = Rect{ .x = 0, .y = 0, .width = 100, .height = 100 };
-    try std.testing.expectError(error.InvalidWorkspace, engine.calculate(9, screen));
-    try std.testing.expectError(error.InvalidWorkspace, engine.calculate(255, screen));
+    const rects = try s.engine.calculate(0, .{ .x = 0, .y = 0, .width = 800, .height = 600 });
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 3), rects.len);
+    try t.expectEqual(@as(u16, 0), rects[0].x);
+    try t.expectEqual(@as(u16, 0), rects[0].y);
+    try t.expectEqual(@as(u16, 600), rects[0].width);
+    try t.expectEqual(@as(u16, 450), rects[0].height);
+    try t.expectEqual(@as(u16, 2), rects[1].x);
+    try t.expectEqual(@as(u16, 2), rects[1].y);
 }
 
-test "workspace — addNode prevents duplicates" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "calculate — zero nodes and invalid workspace" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const screen: Rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
 
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 42);
-    try ws.addNode(allocator, 42);
-    try ws.addNode(allocator, 42);
+    const rects = try s.engine.calculate(0, screen);
+    defer s.allocator.free(rects);
+    try t.expectEqual(@as(usize, 0), rects.len);
 
-    try std.testing.expectEqual(@as(usize, 1), ws.node_ids.items.len);
+    try t.expectError(error.InvalidWorkspace, s.engine.calculate(9, screen));
+    try t.expectError(error.InvalidWorkspace, s.engine.calculate(255, screen));
 }
 
-test "workspace — removeNode clamps active_index" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "addNode prevents duplicates" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 42);
+    try ws.addNode(s.allocator, 42);
+    try ws.addNode(s.allocator, 42);
+    try t.expectEqual(@as(usize, 1), ws.node_ids.items.len);
+}
 
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 1);
-    try ws.addNode(allocator, 2);
-    try ws.addNode(allocator, 3);
-    ws.active_index = 2; // focused on node 3
+test "removeNode — clamps active_index and handles empty" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 1);
+    try ws.addNode(s.allocator, 2);
+    try ws.addNode(s.allocator, 3);
+    ws.active_index = 2;
 
     ws.removeNode(3);
+    try t.expectEqual(@as(usize, 2), ws.node_ids.items.len);
+    try t.expectEqual(@as(usize, 1), ws.active_index);
 
-    try std.testing.expectEqual(@as(usize, 2), ws.node_ids.items.len);
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index); // clamped
-}
-
-test "workspace — removeNode to empty" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 1);
+    // Remove to empty
     ws.removeNode(1);
-
-    try std.testing.expectEqual(@as(usize, 0), ws.node_ids.items.len);
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index);
-    try std.testing.expectEqual(@as(?u64, null), ws.getActiveNodeId());
+    ws.removeNode(2);
+    try t.expectEqual(@as(usize, 0), ws.node_ids.items.len);
+    try t.expectEqual(@as(usize, 0), ws.active_index);
+    try t.expectEqual(@as(?u64, null), ws.getActiveNodeId());
 }
 
-test "workspace — focusNext wraps around" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "focusNext and focusPrev — wrapping and empty" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
 
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 1);
-    try ws.addNode(allocator, 2);
-    try ws.addNode(allocator, 3);
-
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index);
+    // No-op on empty
     ws.focusNext();
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index);
-    ws.focusNext();
-    try std.testing.expectEqual(@as(usize, 2), ws.active_index);
-    ws.focusNext();
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index); // wrapped
-}
-
-test "workspace — focusPrev wraps around" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 1);
-    try ws.addNode(allocator, 2);
-    try ws.addNode(allocator, 3);
-
     ws.focusPrev();
-    try std.testing.expectEqual(@as(usize, 2), ws.active_index); // wrapped to end
+    try t.expectEqual(@as(usize, 0), ws.active_index);
+
+    try ws.addNode(s.allocator, 1);
+    try ws.addNode(s.allocator, 2);
+    try ws.addNode(s.allocator, 3);
+
+    // focusNext wraps
+    try t.expectEqual(@as(usize, 0), ws.active_index);
+    ws.focusNext();
+    try t.expectEqual(@as(usize, 1), ws.active_index);
+    ws.focusNext();
+    try t.expectEqual(@as(usize, 2), ws.active_index);
+    ws.focusNext();
+    try t.expectEqual(@as(usize, 0), ws.active_index);
+
+    // focusPrev wraps
     ws.focusPrev();
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index);
+    try t.expectEqual(@as(usize, 2), ws.active_index);
+    ws.focusPrev();
+    try t.expectEqual(@as(usize, 1), ws.active_index);
 }
 
-test "workspace — focusNext/Prev no-op on empty" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "swapWithNext — normal and wrap" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 10);
+    try ws.addNode(s.allocator, 20);
+    try ws.addNode(s.allocator, 30);
 
-    const ws = &engine.workspaces[0];
-    ws.focusNext(); // should not crash
-    ws.focusPrev(); // should not crash
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index);
-}
-
-test "workspace — swapWithNext" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-    try ws.addNode(allocator, 30);
-
-    // active=0 (node 10), swap with next
+    // Normal swap from index 0
     ws.swapWithNext();
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[0]);
-    try std.testing.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index); // focus follows
+    try t.expectEqual(@as(u64, 20), ws.node_ids.items[0]);
+    try t.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
+    try t.expectEqual(@as(usize, 1), ws.active_index);
+
+    // Wrap: swap from last index
+    ws.active_index = 2;
+    ws.swapWithNext();
+    try t.expectEqual(@as(u64, 30), ws.node_ids.items[0]);
+    try t.expectEqual(@as(usize, 0), ws.active_index);
 }
 
-test "workspace — swapWithPrev" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "swapWithPrev — normal and wrap" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 10);
+    try ws.addNode(s.allocator, 20);
+    try ws.addNode(s.allocator, 30);
 
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-    try ws.addNode(allocator, 30);
-
-    ws.active_index = 2; // focused on node 30
+    // Normal swap from index 2
+    ws.active_index = 2;
     ws.swapWithPrev();
-    try std.testing.expectEqual(@as(u64, 30), ws.node_ids.items[1]);
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[2]);
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index); // focus follows
-}
+    try t.expectEqual(@as(u64, 30), ws.node_ids.items[1]);
+    try t.expectEqual(@as(u64, 20), ws.node_ids.items[2]);
+    try t.expectEqual(@as(usize, 1), ws.active_index);
 
-test "workspace — swapWithNext wraps" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-
-    ws.active_index = 1;
-    ws.swapWithNext(); // wraps: swap index 1 with index 0
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[0]);
-    try std.testing.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index);
-}
-
-test "workspace — swapWithPrev wraps" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-
+    // Wrap: swap from index 0 — state is now [10, 30, 20]
     ws.active_index = 0;
-    ws.swapWithPrev(); // wraps: swap index 0 with index 1
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[0]);
-    try std.testing.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
-    try std.testing.expectEqual(@as(usize, 1), ws.active_index);
+    ws.swapWithPrev();
+    try t.expectEqual(@as(u64, 20), ws.node_ids.items[0]);
+    try t.expectEqual(@as(u64, 10), ws.node_ids.items[2]);
+    try t.expectEqual(@as(usize, 2), ws.active_index);
 }
 
-test "workspace — promoteToMaster" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "promoteToMaster — normal and no-op when already master" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try ws.addNode(s.allocator, 10);
+    try ws.addNode(s.allocator, 20);
+    try ws.addNode(s.allocator, 30);
+    try ws.addNode(s.allocator, 40);
 
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-    try ws.addNode(allocator, 30);
-    try ws.addNode(allocator, 40);
-
-    ws.active_index = 2; // node 30
+    ws.active_index = 2;
     ws.promoteToMaster();
+    try t.expectEqual(@as(u64, 30), ws.node_ids.items[0]);
+    try t.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
+    try t.expectEqual(@as(u64, 20), ws.node_ids.items[2]);
+    try t.expectEqual(@as(u64, 40), ws.node_ids.items[3]);
+    try t.expectEqual(@as(usize, 0), ws.active_index);
 
-    try std.testing.expectEqual(@as(u64, 30), ws.node_ids.items[0]);
-    try std.testing.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[2]);
-    try std.testing.expectEqual(@as(u64, 40), ws.node_ids.items[3]);
-    try std.testing.expectEqual(@as(usize, 0), ws.active_index);
+    // No-op when already at index 0
+    ws.promoteToMaster();
+    try t.expectEqual(@as(u64, 30), ws.node_ids.items[0]);
+    try t.expectEqual(@as(u64, 10), ws.node_ids.items[1]);
 }
 
-test "workspace — promoteToMaster no-op when already master" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try ws.addNode(allocator, 10);
-    try ws.addNode(allocator, 20);
-
-    ws.active_index = 0;
-    ws.promoteToMaster(); // no-op
-
-    try std.testing.expectEqual(@as(u64, 10), ws.node_ids.items[0]);
-    try std.testing.expectEqual(@as(u64, 20), ws.node_ids.items[1]);
-}
-
-test "workspace — getActiveNodeId" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    try std.testing.expectEqual(@as(?u64, null), ws.getActiveNodeId());
-
-    try ws.addNode(allocator, 42);
-    try std.testing.expectEqual(@as(?u64, 42), ws.getActiveNodeId());
-
-    try ws.addNode(allocator, 99);
+test "getActiveNodeId" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
+    try t.expectEqual(@as(?u64, null), ws.getActiveNodeId());
+    try ws.addNode(s.allocator, 42);
+    try t.expectEqual(@as(?u64, 42), ws.getActiveNodeId());
+    try ws.addNode(s.allocator, 99);
     ws.active_index = 1;
-    try std.testing.expectEqual(@as(?u64, 99), ws.getActiveNodeId());
+    try t.expectEqual(@as(?u64, 99), ws.getActiveNodeId());
 }
 
 test "switchWorkspace" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+    var s = testEngine();
+    defer s.engine.deinit();
+    try t.expectEqual(@as(u8, 0), s.engine.active_workspace);
 
-    try std.testing.expectEqual(@as(u8, 0), engine.active_workspace);
+    s.engine.switchWorkspace(3);
+    try t.expectEqual(@as(u8, 3), s.engine.active_workspace);
+    try t.expect(std.mem.eql(u8, "4", s.engine.getActiveWorkspace().name));
 
-    engine.switchWorkspace(3);
-    try std.testing.expectEqual(@as(u8, 3), engine.active_workspace);
-    try std.testing.expect(std.mem.eql(u8, "4", engine.getActiveWorkspace().name));
-
-    engine.switchWorkspace(8);
-    try std.testing.expectEqual(@as(u8, 8), engine.active_workspace);
-    try std.testing.expect(std.mem.eql(u8, "9", engine.getActiveWorkspace().name));
+    s.engine.switchWorkspace(8);
+    try t.expectEqual(@as(u8, 8), s.engine.active_workspace);
+    try t.expect(std.mem.eql(u8, "9", s.engine.getActiveWorkspace().name));
 
     // Out of range — no change
-    engine.switchWorkspace(9);
-    try std.testing.expectEqual(@as(u8, 8), engine.active_workspace);
-    engine.switchWorkspace(255);
-    try std.testing.expectEqual(@as(u8, 8), engine.active_workspace);
+    s.engine.switchWorkspace(9);
+    try t.expectEqual(@as(u8, 8), s.engine.active_workspace);
+    s.engine.switchWorkspace(255);
+    try t.expectEqual(@as(u8, 8), s.engine.active_workspace);
 }
 
 test "moveNodeToWorkspace" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+    var s = testEngine();
+    defer s.engine.deinit();
+    try s.engine.workspaces[0].addNode(s.allocator, 1);
+    try s.engine.workspaces[0].addNode(s.allocator, 2);
+    try s.engine.workspaces[0].addNode(s.allocator, 3);
 
-    try engine.workspaces[0].addNode(allocator, 1);
-    try engine.workspaces[0].addNode(allocator, 2);
-    try engine.workspaces[0].addNode(allocator, 3);
-
-    // Move node 2 from workspace 0 to workspace 3
-    try engine.moveNodeToWorkspace(2, 3);
-
-    try std.testing.expectEqual(@as(usize, 2), engine.workspaces[0].nodeCount());
-    try std.testing.expectEqual(@as(usize, 1), engine.workspaces[3].nodeCount());
-    try std.testing.expectEqual(@as(?u64, 2), engine.workspaces[3].getActiveNodeId());
-
-    // Verify node 2 is gone from workspace 0
-    for (engine.workspaces[0].node_ids.items) |id| {
-        try std.testing.expect(id != 2);
+    try s.engine.moveNodeToWorkspace(2, 3);
+    try t.expectEqual(@as(usize, 2), s.engine.workspaces[0].nodeCount());
+    try t.expectEqual(@as(usize, 1), s.engine.workspaces[3].nodeCount());
+    try t.expectEqual(@as(?u64, 2), s.engine.workspaces[3].getActiveNodeId());
+    for (s.engine.workspaces[0].node_ids.items) |id| {
+        try t.expect(id != 2);
     }
+
+    // Invalid target
+    try t.expectError(error.InvalidWorkspace, s.engine.moveNodeToWorkspace(1, 9));
 }
 
-test "moveNodeToWorkspace — invalid target" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
+test "addNode/removeNode auto-selects layout" {
+    var s = testEngine();
+    defer s.engine.deinit();
+    const ws = &s.engine.workspaces[0];
 
-    try std.testing.expectError(error.InvalidWorkspace, engine.moveNodeToWorkspace(1, 9));
-}
+    // Adding nodes transitions monocle -> master_stack -> grid
+    try ws.addNode(s.allocator, 1);
+    try t.expectEqual(Layout.monocle, ws.layout);
+    try ws.addNode(s.allocator, 2);
+    try t.expectEqual(Layout.master_stack, ws.layout);
+    try ws.addNode(s.allocator, 3);
+    try t.expectEqual(Layout.master_stack, ws.layout);
+    try ws.addNode(s.allocator, 4);
+    try t.expectEqual(Layout.master_stack, ws.layout);
+    try ws.addNode(s.allocator, 5);
+    try t.expectEqual(Layout.grid, ws.layout);
 
-test "workspace — addNode auto-selects layout" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-
-    try ws.addNode(allocator, 1);
-    try std.testing.expectEqual(Layout.monocle, ws.layout);
-
-    try ws.addNode(allocator, 2);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
-    try ws.addNode(allocator, 3);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
-    try ws.addNode(allocator, 4);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
-    try ws.addNode(allocator, 5);
-    try std.testing.expectEqual(Layout.grid, ws.layout);
-}
-
-test "workspace — removeNode auto-selects layout" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    const ws = &engine.workspaces[0];
-    for (1..6) |id| {
-        try ws.addNode(allocator, @intCast(id));
-    }
-    try std.testing.expectEqual(Layout.grid, ws.layout);
-
+    // Removing nodes transitions back
     ws.removeNode(5);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
+    try t.expectEqual(Layout.master_stack, ws.layout);
     ws.removeNode(4);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
+    try t.expectEqual(Layout.master_stack, ws.layout);
     ws.removeNode(3);
-    try std.testing.expectEqual(Layout.master_stack, ws.layout);
-
+    try t.expectEqual(Layout.master_stack, ws.layout);
     ws.removeNode(2);
-    try std.testing.expectEqual(Layout.monocle, ws.layout);
-
+    try t.expectEqual(Layout.monocle, ws.layout);
     ws.removeNode(1);
-    try std.testing.expectEqual(Layout.monocle, ws.layout);
-}
-
-test "master_stack — screen with offset origin" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try engine.workspaces[0].addNode(allocator, 1);
-    try engine.workspaces[0].addNode(allocator, 2);
-    engine.workspaces[0].layout = .master_stack;
-    engine.workspaces[0].master_ratio = 0.5;
-
-    // Screen starts at (10, 20) — e.g., inside a border/tab bar
-    const screen = Rect{ .x = 10, .y = 20, .width = 800, .height = 600 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(u16, 10), rects[0].x);
-    try std.testing.expectEqual(@as(u16, 20), rects[0].y);
-    try std.testing.expectEqual(@as(u16, 400), rects[0].width);
-
-    try std.testing.expectEqual(@as(u16, 410), rects[1].x);
-    try std.testing.expectEqual(@as(u16, 20), rects[1].y);
-    try std.testing.expectEqual(@as(u16, 400), rects[1].width);
-}
-
-test "master_stack — remainder height distribution" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try engine.workspaces[0].addNode(allocator, 1);
-    try engine.workspaces[0].addNode(allocator, 2);
-    try engine.workspaces[0].addNode(allocator, 3);
-    engine.workspaces[0].layout = .master_stack;
-
-    // 100 height / 2 stack panes = 50 each, no remainder
-    const screen = Rect{ .x = 0, .y = 0, .width = 100, .height = 101 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    // Stack pane 1: h=50, stack pane 2: h=51 (gets remainder)
-    try std.testing.expectEqual(@as(u16, 50), rects[1].height);
-    try std.testing.expectEqual(@as(u16, 51), rects[2].height);
-
-    // Verify total coverage
-    try std.testing.expectEqual(@as(u16, 0), rects[1].y);
-    try std.testing.expectEqual(@as(u16, 50), rects[2].y);
-}
-
-test "grid layout — single node gets full screen" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try engine.workspaces[0].addNode(allocator, 1);
-    engine.workspaces[0].layout = .grid;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 500, .height = 400 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expect(rects[0].eql(screen));
-}
-
-test "monocle — focus changes which node gets full screen" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try engine.workspaces[0].addNode(allocator, 1);
-    try engine.workspaces[0].addNode(allocator, 2);
-    engine.workspaces[0].layout = .monocle;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 800, .height = 600 };
-
-    // Focus on node 1 (index 0)
-    engine.workspaces[0].active_index = 0;
-    const rects1 = try engine.calculate(0, screen);
-    defer allocator.free(rects1);
-    try std.testing.expect(rects1[0].eql(screen));
-    try std.testing.expect(rects1[1].eql(Rect.zero));
-
-    // Focus on node 2 (index 1)
-    engine.workspaces[0].active_index = 1;
-    const rects2 = try engine.calculate(0, screen);
-    defer allocator.free(rects2);
-    try std.testing.expect(rects2[0].eql(Rect.zero));
-    try std.testing.expect(rects2[1].eql(screen));
+    try t.expectEqual(Layout.monocle, ws.layout);
 }
 
 test "engine init — 9 workspaces with correct names" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    try std.testing.expectEqual(@as(u8, 0), engine.active_workspace);
-
-    for (engine.workspaces, 0..) |ws, i| {
+    var s = testEngine();
+    defer s.engine.deinit();
+    try t.expectEqual(@as(u8, 0), s.engine.active_workspace);
+    for (s.engine.workspaces, 0..) |ws, i| {
         const expected_name = [_]u8{'1' + @as(u8, @intCast(i))};
-        try std.testing.expect(std.mem.eql(u8, &expected_name, ws.name));
-        try std.testing.expectEqual(@as(usize, 0), ws.node_ids.items.len);
-        try std.testing.expectEqual(Layout.monocle, ws.layout);
+        try t.expect(std.mem.eql(u8, &expected_name, ws.name));
+        try t.expectEqual(@as(usize, 0), ws.node_ids.items.len);
+        try t.expectEqual(Layout.monocle, ws.layout);
     }
-}
-
-test "grid layout — five nodes (3x2 grid, last row sparse)" {
-    const allocator = std.testing.allocator;
-    var engine = LayoutEngine.init(allocator);
-    defer engine.deinit();
-
-    for (1..6) |id| {
-        try engine.workspaces[0].addNode(allocator, @intCast(id));
-    }
-    engine.workspaces[0].layout = .grid;
-
-    const screen = Rect{ .x = 0, .y = 0, .width = 900, .height = 600 };
-    const rects = try engine.calculate(0, screen);
-    defer allocator.free(rects);
-
-    try std.testing.expectEqual(@as(usize, 5), rects.len);
-
-    // 3 cols, 2 rows. Cells: 300x300
-    // Row 0: nodes 0,1,2
-    try std.testing.expectEqual(@as(u16, 0), rects[0].x);
-    try std.testing.expectEqual(@as(u16, 300), rects[1].x);
-    try std.testing.expectEqual(@as(u16, 600), rects[2].x);
-
-    // Row 1: nodes 3,4 (5th slot empty — but we still compute rects for existing nodes)
-    try std.testing.expectEqual(@as(u16, 0), rects[3].x);
-    try std.testing.expectEqual(@as(u16, 300), rects[3].y);
-    try std.testing.expectEqual(@as(u16, 300), rects[4].x);
-    try std.testing.expectEqual(@as(u16, 300), rects[4].y);
 }
