@@ -138,15 +138,8 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Early PTY reads to catch shell startup queries (DA1, DSR, XTGETTCAP).
-    // Fish sends DA1 immediately on startup — we need to respond before
-    // its 2-second timeout. Do several reads with small delays to catch it.
-    if (mux.getActivePane()) |pane| {
-        for (0..10) |_| {
-            _ = pane.readAndProcess(&pty_buf) catch {};
-            io.sleep(.fromMilliseconds(5), .awake) catch {};
-        }
-    }
+    // DA1 response is sent proactively in Multiplexer.spawnPane() —
+    // no need for early PTY reads here.
 
     while (running) {
         // Check prefix timeout
