@@ -1,4 +1,5 @@
 const std = @import("std");
+const Scrollback = @import("../persist/Scrollback.zig");
 
 /// Character grid for terminal cell data.
 /// Stores a flat array of cells (rows * cols) with cursor position
@@ -41,6 +42,10 @@ cursor_col: u16 = 0,
 scroll_top: u16 = 0,
 scroll_bottom: u16,
 dirty: bool = true,
+
+/// Optional scrollback buffer. When set, lines that scroll off the top
+/// are captured as text and pushed to the scrollback.
+scrollback: ?*Scrollback = null,
 
 /// Pen: current attributes applied to newly written cells.
 pen_fg: Color = .default,
@@ -131,6 +136,24 @@ pub fn scrollUpN(self: *Grid, n: u16) void {
 
     var i: u16 = 0;
     while (i < n) : (i += 1) {
+        // Push the top line to scrollback before it's overwritten
+        if (self.scrollback) |sb| {
+            var line_buf: [512]u8 = undefined;
+            var len: usize = 0;
+            for (0..w) |col| {
+                const cell = self.cellAtConst(@intCast(top), @intCast(col));
+                if (cell.char < 128 and cell.char >= 32) {
+                    if (len < line_buf.len) {
+                        line_buf[len] = @intCast(cell.char);
+                        len += 1;
+                    }
+                }
+            }
+            // Trim trailing spaces
+            while (len > 0 and line_buf[len - 1] == ' ') len -= 1;
+            sb.pushLine(line_buf[0..len], self) catch {};
+        }
+
         // Shift rows up within the scroll region
         var row = top;
         while (row < bottom) : (row += 1) {
@@ -520,4 +543,42 @@ test "save and restore cursor" {
 
     try std.testing.expectEqual(@as(u16, 5), grid.cursor_row);
     try std.testing.expectEqual(@as(u16, 10), grid.cursor_col);
+}
+
+test "scrollUp pushes line to scrollback" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 10);
+    defer grid.deinit(allocator);
+
+    var sb = Scrollback.init(allocator, .{ .keyframe_interval = 100 });
+    defer sb.deinit();
+    grid.scrollback = &sb;
+
+    // Fill row 0 with "Hello"
+    grid.cellAt(0, 0).char = 'H';
+    grid.cellAt(0, 1).char = 'e';
+    grid.cellAt(0, 2).char = 'l';
+    grid.cellAt(0, 3).char = 'l';
+    grid.cellAt(0, 4).char = 'o';
+    // Columns 5-9 are spaces (should be trimmed)
+
+    grid.scrollUp();
+
+    // Scrollback should have captured one line
+    try std.testing.expectEqual(@as(u64, 1), sb.total_lines);
+    // The delta should contain "Hello" (5 bytes, trailing spaces trimmed)
+    try std.testing.expectEqual(@as(usize, 1), sb.deltas.items.len);
+    try std.testing.expectEqualStrings("Hello", sb.deltas.items[0].vt_bytes);
+}
+
+test "scrollUp with no scrollback is safe" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+
+    // scrollback is null by default — scrollUp should not crash
+    grid.cellAt(0, 0).char = 'X';
+    grid.scrollUp();
+
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(2, 0).char);
 }

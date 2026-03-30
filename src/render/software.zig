@@ -176,6 +176,23 @@ pub const SoftwareRenderer = struct {
                 }
             }
         }
+
+        // 3. Draw cursor (block style — filled rectangle at cursor position)
+        // NOTE: Grid does not yet track cursor_visible (ESC[?25h/l).
+        // When that field is added, gate this block on it.
+        if (grid.cursor_row < grid.rows and grid.cursor_col < grid.cols) {
+            const cx: usize = @as(usize, grid.cursor_col) * cw;
+            const cy: usize = @as(usize, grid.cursor_row) * ch;
+            const cursor_color: u32 = 0xFFFF9922; // orange (miozu accent)
+
+            const cursor_max_y = @min(cy + ch, fb_h);
+            const cursor_max_x = @min(cx + cw, fb_w);
+
+            for (cy..cursor_max_y) |py| {
+                const row_start = py * fb_w;
+                @memset(self.framebuffer[row_start + cx .. row_start + cursor_max_x], cursor_color);
+            }
+        }
     }
 
     /// Blit a single glyph from the atlas into the framebuffer.
@@ -368,10 +385,24 @@ test "render empty grid" {
 
     renderer.render(&grid);
 
-    // All pixels should be the default background color
+    // Non-cursor pixels should be the default background color.
+    // Cursor is at (0,0) so the first cell_width*cell_height pixels are cursor_color.
     const bg = resolveColorArgb(.default, false);
-    for (renderer.framebuffer) |pixel| {
-        try std.testing.expectEqual(bg, pixel);
+    const cursor_color: u32 = 0xFFFF9922;
+    const cw: usize = renderer.cell_width;
+    const ch: usize = renderer.cell_height;
+    const fb_w: usize = renderer.width;
+
+    for (0..renderer.height) |py| {
+        for (0..renderer.width) |px| {
+            const pixel = renderer.framebuffer[py * fb_w + px];
+            if (px < cw and py < ch) {
+                // Inside cursor block
+                try std.testing.expectEqual(cursor_color, pixel);
+            } else {
+                try std.testing.expectEqual(bg, pixel);
+            }
+        }
     }
 }
 
@@ -517,10 +548,10 @@ test "performance: 5000 cells" {
     // (debug builds ~ms, release builds ~us for 640K pixels).
     renderer.render(&grid);
 
-    // Verify render actually ran: check a sample pixel is background color
-    // (no atlas means all cells are background-only)
+    // Verify render actually ran: cursor at (0,0) draws orange, last pixel is bg
     const bg = resolveColorArgb(.default, false);
-    try std.testing.expectEqual(bg, renderer.framebuffer[0]);
+    const cursor_color: u32 = 0xFFFF9922;
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[0]); // cursor at (0,0)
     try std.testing.expectEqual(bg, renderer.framebuffer[renderer.framebuffer.len - 1]);
 }
 
@@ -544,6 +575,38 @@ test "dimColor halves channels" {
     const bright = packArgb(200, 100, 50);
     const dimmed = dimColor(bright);
     try std.testing.expectEqual(packArgb(100, 50, 25), dimmed);
+}
+
+test "cursor rendered as block at cursor position" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+
+    // Place cursor at row 1, col 2
+    grid.cursor_row = 1;
+    grid.cursor_col = 2;
+
+    const cw: u32 = 2;
+    const ch: u32 = 2;
+    var renderer = try SoftwareRenderer.init(allocator, 4 * cw, 3 * ch, cw, ch);
+    defer renderer.deinit();
+
+    renderer.render(&grid);
+
+    // Cursor block at (col=2, row=1) -> pixel (4,2) to (5,3)
+    const cursor_color: u32 = 0xFFFF9922;
+    const fb_w = 4 * cw;
+
+    // Pixels inside cursor block should be cursor_color
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[2 * fb_w + 4]); // (4, 2)
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[2 * fb_w + 5]); // (5, 2)
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[3 * fb_w + 4]); // (4, 3)
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[3 * fb_w + 5]); // (5, 3)
+
+    // Pixel outside cursor should be default background
+    const bg = resolveColorArgb(.default, false);
+    try std.testing.expectEqual(bg, renderer.framebuffer[0]); // (0, 0)
+    try std.testing.expectEqual(bg, renderer.framebuffer[2 * fb_w + 0]); // (0, 2)
 }
 
 test "blitGlyphRow SIMD and scalar produce same results" {

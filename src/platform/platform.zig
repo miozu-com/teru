@@ -6,26 +6,9 @@
 
 const builtin = @import("builtin");
 
-pub const Event = switch (builtin.os.tag) {
-    .linux => @import("linux/platform.zig").Event,
-    .macos => @import("macos/platform.zig").Event,
-    .windows => @import("windows/platform.zig").Event,
-    else => @compileError("unsupported platform: " ++ @tagName(builtin.os.tag)),
-};
-
-pub const KeyEvent = switch (builtin.os.tag) {
-    .linux => @import("linux/platform.zig").KeyEvent,
-    .macos => @import("macos/platform.zig").KeyEvent,
-    .windows => @import("windows/platform.zig").KeyEvent,
-    else => @compileError("unsupported platform: " ++ @tagName(builtin.os.tag)),
-};
-
-pub const Size = switch (builtin.os.tag) {
-    .linux => @import("linux/platform.zig").Size,
-    .macos => @import("macos/platform.zig").Size,
-    .windows => @import("windows/platform.zig").Size,
-    else => @compileError("unsupported platform: " ++ @tagName(builtin.os.tag)),
-};
+pub const Event = @import("types.zig").Event;
+pub const KeyEvent = @import("types.zig").KeyEvent;
+pub const Size = @import("types.zig").Size;
 
 pub const Platform = switch (builtin.os.tag) {
     .linux => @import("linux/platform.zig").Platform,

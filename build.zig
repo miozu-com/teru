@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     // System dependencies: link only the enabled backends
     if (enable_x11) {
         exe_mod.linkSystemLibrary("xcb", .{});
+        exe_mod.linkSystemLibrary("xkbcommon", .{});
     }
     if (enable_wayland) {
         exe_mod.linkSystemLibrary("wayland-client", .{});

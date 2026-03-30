@@ -145,7 +145,10 @@ pub fn scanForAgentSequences(
     return .{ .events = event_count, .passthrough = pass_count };
 }
 
-fn parsePayload(payload: []const u8) ?AgentEvent {
+/// Parse a raw OSC 9999 payload (without ESC framing) into an AgentEvent.
+/// The payload format is: command;key=value;key=value...
+/// Returns null if the command is unrecognized.
+pub fn parsePayload(payload: []const u8) ?AgentEvent {
     var event = AgentEvent{ .command = .meta };
     var iter = std.mem.splitScalar(u8, payload, ';');
 

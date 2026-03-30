@@ -204,25 +204,12 @@ fn IDC_ARROW() LPCWSTR {
     return @ptrFromInt(32512);
 }
 
-// ── Shared types (matching linux/platform.zig) ──────────────────────
+// ── Shared types (from platform/types.zig) ──────────────────────────
 
-pub const KeyEvent = struct {
-    keycode: u32,
-    modifiers: u32,
-};
-
-pub const Event = union(enum) {
-    key_press: KeyEvent,
-    key_release: KeyEvent,
-    resize: struct { width: u32, height: u32 },
-    close,
-    focus_in,
-    focus_out,
-    expose,
-    none,
-};
-
-pub const Size = struct { width: u32, height: u32 };
+const types = @import("../types.zig");
+pub const KeyEvent = types.KeyEvent;
+pub const Event = types.Event;
+pub const Size = types.Size;
 
 // ── Win32 window ────────────────────────────────────────────────────
 

@@ -52,6 +52,11 @@ cursor_visible: bool = true,
 /// Alt screen active
 alt_screen: bool = false,
 
+/// Agent protocol: last OSC 9999 payload for external consumption
+agent_event_buf: [512]u8 = undefined,
+agent_event_len: usize = 0,
+has_agent_event: bool = false,
+
 pub fn init(grid: *Grid) VtParser {
     return .{ .grid = grid };
 }
@@ -342,13 +347,45 @@ fn finishOsc(self: *VtParser) void {
 
     const data = self.osc_buf[0..self.osc_len];
 
-    // Parse OSC 0;title or OSC 2;title
-    if (data.len >= 2 and (data[0] == '0' or data[0] == '2') and data[1] == ';') {
-        const title_data = data[2..];
-        const copy_len = @min(title_data.len, MAX_OSC_LEN);
-        @memcpy(self.title[0..copy_len], title_data[0..copy_len]);
-        self.title_len = @intCast(copy_len);
+    // Parse the OSC number (digits before the first ';')
+    var num_end: usize = 0;
+    while (num_end < data.len and data[num_end] >= '0' and data[num_end] <= '9') {
+        num_end += 1;
     }
+
+    if (num_end > 0 and num_end < data.len and data[num_end] == ';') {
+        const osc_num = std.fmt.parseInt(u16, data[0..num_end], 10) catch 0;
+        const payload = data[num_end + 1 ..];
+
+        switch (osc_num) {
+            0, 2 => {
+                // Window title
+                const copy_len = @min(payload.len, MAX_OSC_LEN);
+                @memcpy(self.title[0..copy_len], payload[0..copy_len]);
+                self.title_len = @intCast(copy_len);
+            },
+            9999 => {
+                // Agent protocol — store payload for external consumption
+                if (payload.len <= self.agent_event_buf.len) {
+                    @memcpy(self.agent_event_buf[0..payload.len], payload);
+                    self.agent_event_len = payload.len;
+                    self.has_agent_event = true;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Consume the last agent protocol event (OSC 9999 payload).
+/// Returns the payload slice, or null if no event is pending.
+/// Clears the event flag so the same event isn't consumed twice.
+pub fn consumeAgentEvent(self: *VtParser) ?[]const u8 {
+    if (self.has_agent_event) {
+        self.has_agent_event = false;
+        return self.agent_event_buf[0..self.agent_event_len];
+    }
+    return null;
 }
 
 // ── CSI dispatch ─────────────────────────────────────────────────

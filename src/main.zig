@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Pty = @import("pty/Pty.zig");
 const Grid = @import("core/Grid.zig");
@@ -7,6 +8,12 @@ const ProcessGraph = @import("graph/ProcessGraph.zig");
 const Terminal = @import("core/Terminal.zig");
 const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
+const protocol = @import("agent/protocol.zig");
+const build_options = @import("build_options");
+const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
+    @import("platform/linux/keyboard.zig").Keyboard
+else
+    void;
 
 const version = "0.1.0";
 
@@ -72,6 +79,15 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
 
     var vt = VtParser.init(&grid);
 
+    // Keyboard input: xkbcommon translates XCB keycodes → UTF-8
+    var keyboard = if (Keyboard != void)
+        Keyboard.init() catch null
+    else
+        null;
+    defer if (Keyboard != void) {
+        if (keyboard) |*kb| kb.deinit();
+    };
+
     var pty = try Pty.spawn(.{ .rows = grid_rows, .cols = grid_cols });
     defer pty.deinit();
 
@@ -100,10 +116,29 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                     }
                 },
                 .key_press => |key| {
-                    // TODO: xkbcommon keycode → UTF-8 translation
-                    if (key.keycode < 128) {
-                        const byte = [1]u8{@truncate(key.keycode)};
-                        _ = pty.write(&byte) catch {};
+                    if (Keyboard != void) {
+                        if (keyboard) |*kb| {
+                            var key_buf: [32]u8 = undefined;
+                            const len = kb.processKey(key.keycode, true, &key_buf);
+                            if (len > 0) {
+                                _ = pty.write(key_buf[0..len]) catch {};
+                            }
+                        }
+                    } else {
+                        // Fallback: raw keycode passthrough (no xkbcommon)
+                        if (key.keycode < 128) {
+                            const byte = [1]u8{@truncate(key.keycode)};
+                            _ = pty.write(&byte) catch {};
+                        }
+                    }
+                },
+                .key_release => |key| {
+                    // Update xkbcommon modifier state on key release
+                    if (Keyboard != void) {
+                        if (keyboard) |*kb| {
+                            var dummy: [1]u8 = undefined;
+                            _ = kb.processKey(key.keycode, false, &dummy);
+                        }
                     }
                 },
                 else => {},
@@ -117,6 +152,23 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
         if (n > 0) {
             vt.feed(pty_buf[0..n]);
             grid.dirty = true;
+
+            // Check for agent protocol events (OSC 9999)
+            if (vt.consumeAgentEvent()) |payload| {
+                if (protocol.parsePayload(payload)) |event| {
+                    // Update process graph with agent metadata
+                    switch (event.command) {
+                        .start => {
+                            _ = graph.spawn(.{
+                                .name = event.name orelse "agent",
+                                .kind = .agent,
+                                .pid = null,
+                            }) catch {};
+                        },
+                        else => {},
+                    }
+                }
+            }
         }
 
         if (grid.dirty) {

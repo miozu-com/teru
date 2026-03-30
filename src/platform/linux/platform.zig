@@ -21,23 +21,10 @@ const wayland = if (enable_wayland) @import("wayland.zig") else struct {
     pub const WaylandWindow = void;
 };
 
-pub const KeyEvent = struct {
-    keycode: u32,
-    modifiers: u32,
-};
-
-pub const Event = union(enum) {
-    key_press: KeyEvent,
-    key_release: KeyEvent,
-    resize: struct { width: u32, height: u32 },
-    close,
-    focus_in,
-    focus_out,
-    expose,
-    none,
-};
-
-pub const Size = struct { width: u32, height: u32 };
+const types = @import("../types.zig");
+pub const KeyEvent = types.KeyEvent;
+pub const Event = types.Event;
+pub const Size = types.Size;
 
 // When both backends are enabled, use a tagged union for runtime dispatch.
 // When only one backend is enabled, the Platform is a thin wrapper around it
