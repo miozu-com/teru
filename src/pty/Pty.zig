@@ -1,0 +1,171 @@
+const std = @import("std");
+const posix = std.posix;
+
+const Pty = @This();
+
+master: posix.fd_t,
+slave: posix.fd_t,
+child_pid: ?posix.pid_t,
+
+pub const SpawnOptions = struct {
+    shell: ?[]const u8 = null,
+    rows: u16 = 24,
+    cols: u16 = 80,
+    cwd: ?[]const u8 = null,
+    env: ?[*:null]const ?[*:0]const u8 = null,
+};
+
+pub fn spawn(opts: SpawnOptions) !Pty {
+    const shell = opts.shell orelse getDefaultShell();
+
+    // Open pseudoterminal
+    const master = try posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
+    errdefer posix.close(master);
+
+    // Grant and unlock slave
+    if (grantpt(master) != 0) return error.GrantPtFailed;
+    if (unlockpt(master) != 0) return error.UnlockPtFailed;
+
+    // Get slave path
+    const slave_path = ptsname(master) orelse return error.PtsnameFailed;
+
+    // Set initial window size
+    const ws = posix.winsize{
+        .row = opts.rows,
+        .col = opts.cols,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    _ = posix.system.ioctl(master, posix.T.IOCSWINSZ, @intFromPtr(&ws));
+
+    // Fork
+    const pid = try posix.fork();
+
+    if (pid == 0) {
+        // ── Child process ────────────────────────────────────────
+        posix.close(master);
+
+        // New session
+        _ = posix.system.setsid();
+
+        // Open slave as controlling terminal
+        const slave = posix.openZ(slave_path, .{ .ACCMODE = .RDWR }, 0) catch {
+            posix.exit(1);
+        };
+
+        // Set controlling terminal
+        _ = posix.system.ioctl(slave, posix.T.IOCSCTTY, @as(usize, 0));
+
+        // Redirect stdin/stdout/stderr to slave PTY
+        posix.dup2(slave, 0) catch posix.exit(1);
+        posix.dup2(slave, 1) catch posix.exit(1);
+        posix.dup2(slave, 2) catch posix.exit(1);
+        if (slave > 2) posix.close(slave);
+
+        // Set window size on the slave side too
+        _ = posix.system.ioctl(0, posix.T.IOCSWINSZ, @intFromPtr(&ws));
+
+        // Set environment
+        setChildEnv(opts.cols, opts.rows);
+
+        // Change directory if specified
+        if (opts.cwd) |cwd| {
+            var cwd_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+            if (cwd.len < cwd_buf.len) {
+                @memcpy(cwd_buf[0..cwd.len], cwd);
+                cwd_buf[cwd.len] = 0;
+                _ = posix.system.chdir(&cwd_buf);
+            }
+        }
+
+        // Exec shell (copy to null-terminated buffer)
+        var shell_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        @memcpy(shell_buf[0..shell.len], shell);
+        shell_buf[shell.len] = 0;
+        const shell_z: [*:0]const u8 = &shell_buf;
+        const argv = [_:null]?[*:0]const u8{ shell_z, null };
+        const env = opts.env orelse std.c.environ;
+        _ = posix.system.execve(shell_z, &argv, @ptrCast(env));
+        posix.exit(1);
+    }
+
+    // ── Parent process ───────────────────────────────────────────
+    return Pty{
+        .master = master,
+        .slave = 0, // Parent doesn't need the slave fd
+        .child_pid = pid,
+    };
+}
+
+pub fn read(self: *const Pty, buf: []u8) !usize {
+    return posix.read(self.master, buf);
+}
+
+pub fn write(self: *const Pty, data: []const u8) !usize {
+    return posix.write(self.master, data);
+}
+
+pub fn resize(self: *const Pty, rows: u16, cols: u16) void {
+    const ws = posix.winsize{
+        .row = rows,
+        .col = cols,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    _ = posix.system.ioctl(self.master, posix.T.IOCSWINSZ, @intFromPtr(&ws));
+}
+
+pub fn waitForExit(self: *const Pty) !u32 {
+    if (self.child_pid) |pid| {
+        const result = posix.waitpid(pid, 0);
+        return result.status;
+    }
+    return 0;
+}
+
+pub fn deinit(self: *Pty) void {
+    // Signal child to terminate
+    if (self.child_pid) |pid| {
+        posix.kill(pid, posix.SIG.HUP) catch {};
+    }
+    posix.close(self.master);
+    self.master = -1;
+    self.child_pid = null;
+}
+
+pub fn isAlive(self: *const Pty) bool {
+    if (self.child_pid) |pid| {
+        const result = posix.waitpid(pid, posix.W{ .NOHANG = true });
+        return result.pid == 0; // 0 means still running
+    }
+    return false;
+}
+
+// ── Private helpers ──────────────────────────────────────────────
+
+fn getDefaultShell() []const u8 {
+    if (std.posix.getenv("SHELL")) |shell| return shell;
+    return "/bin/sh";
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn setChildEnv(cols: u16, rows: u16) void {
+    _ = setenv("TERM", "xterm-256color", 1);
+    _ = setenv("COLORTERM", "truecolor", 1);
+    _ = setenv("TERM_PROGRAM", "teru", 1);
+    _ = setenv("TERM_PROGRAM_VERSION", "0.0.1", 1);
+
+    var cols_buf: [8:0]u8 = undefined;
+    var rows_buf: [8:0]u8 = undefined;
+    const cols_str = std.fmt.bufPrint(&cols_buf, "{d}", .{cols}) catch "80";
+    const rows_str = std.fmt.bufPrint(&rows_buf, "{d}", .{rows}) catch "24";
+    _ = setenv("COLUMNS", @ptrCast(cols_str.ptr), 1);
+    _ = setenv("LINES", @ptrCast(rows_str.ptr), 1);
+}
+
+// ── C interop for PTY functions ──────────────────────────────────
+
+extern "c" fn grantpt(fd: c_int) c_int;
+extern "c" fn unlockpt(fd: c_int) c_int;
+extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;

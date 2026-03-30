@@ -1,0 +1,851 @@
+const std = @import("std");
+const Grid = @import("Grid.zig");
+
+/// VT100/xterm escape sequence parser.
+/// State machine that takes raw bytes and drives a Grid.
+///
+/// Supported sequences:
+///   Cursor:   ESC[A/B/C/D (movement), ESC[H/f (position), ESC[s/u (save/restore), ESC 7/8
+///   Erase:    ESC[J (display), ESC[K (line)
+///   SGR:      ESC[0-8m (attrs), ESC[30-37/40-47m (basic), ESC[38;5;N/48;5;Nm (256),
+///             ESC[38;2;R;G;B/48;2;R;G;Bm (truecolor)
+///   Scroll:   ESC[S (up), ESC[T (down)
+///   Mode:     ESC[?25h/l (cursor visibility), ESC[?1049h/l (alt screen)
+///   OSC:      ESC]0;...BEL (set title)
+///   Control:  CR, LF, BS, TAB, BEL
+const VtParser = @This();
+
+pub const State = enum {
+    ground,
+    escape, // saw ESC
+    csi_entry, // saw ESC[
+    csi_param, // collecting params
+    csi_intermediate, // saw intermediate byte (0x20-0x2F)
+    osc_string, // saw ESC], collecting until BEL/ST
+};
+
+pub const MAX_PARAMS = 16;
+pub const MAX_OSC_LEN = 256;
+
+state: State = .ground,
+grid: *Grid,
+
+/// CSI parameter accumulation
+params: [MAX_PARAMS]u16 = [_]u16{0} ** MAX_PARAMS,
+param_count: u8 = 0,
+/// Whether a '?' prefix was seen in CSI (private mode)
+private_marker: bool = false,
+/// Intermediate byte (e.g., ' ', '!', '"', etc.)
+intermediate: u8 = 0,
+
+/// OSC string buffer
+osc_buf: [MAX_OSC_LEN]u8 = [_]u8{0} ** MAX_OSC_LEN,
+osc_len: u16 = 0,
+
+/// Parsed title from OSC 0
+title: [MAX_OSC_LEN]u8 = [_]u8{0} ** MAX_OSC_LEN,
+title_len: u16 = 0,
+
+/// Cursor visibility
+cursor_visible: bool = true,
+
+/// Alt screen active
+alt_screen: bool = false,
+
+pub fn init(grid: *Grid) VtParser {
+    return .{ .grid = grid };
+}
+
+/// Feed a slice of bytes into the parser.
+pub fn feed(self: *VtParser, data: []const u8) void {
+    for (data) |byte| {
+        self.processByte(byte);
+    }
+}
+
+/// Process a single byte through the state machine.
+fn processByte(self: *VtParser, byte: u8) void {
+    switch (self.state) {
+        .ground => self.handleGround(byte),
+        .escape => self.handleEscape(byte),
+        .csi_entry => self.handleCsiEntry(byte),
+        .csi_param => self.handleCsiParam(byte),
+        .csi_intermediate => self.handleCsiIntermediate(byte),
+        .osc_string => self.handleOscString(byte),
+    }
+}
+
+// ── Ground state ─────────────────────────────────────────────────
+
+fn handleGround(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        0x1B => { // ESC
+            self.state = .escape;
+        },
+        0x07 => {}, // BEL — ignore in ground
+        0x08 => { // BS (backspace)
+            if (self.grid.cursor_col > 0) {
+                self.grid.cursor_col -= 1;
+            }
+        },
+        0x09 => { // TAB — advance to next tab stop (every 8 columns)
+            const next = (self.grid.cursor_col / 8 + 1) * 8;
+            self.grid.cursor_col = @min(next, self.grid.cols -| 1);
+        },
+        0x0A, 0x0B, 0x0C => { // LF, VT, FF
+            self.grid.newline();
+        },
+        0x0D => { // CR
+            self.grid.cursor_col = 0;
+        },
+        0x00...0x06, 0x0E...0x1A, 0x1C...0x1F => {
+            // Other C0 controls: ignore
+        },
+        else => {
+            // Printable character (or high byte — treat as Latin-1 for now)
+            self.grid.write(@as(u21, byte));
+        },
+    }
+}
+
+// ── Escape state (saw ESC) ───────────────────────────────────────
+
+fn handleEscape(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        '[' => {
+            self.resetCsiState();
+            self.state = .csi_entry;
+        },
+        ']' => {
+            self.osc_len = 0;
+            self.state = .osc_string;
+        },
+        '7' => { // DECSC: save cursor
+            self.grid.saveCursor();
+            self.state = .ground;
+        },
+        '8' => { // DECRC: restore cursor
+            self.grid.restoreCursor();
+            self.state = .ground;
+        },
+        'D' => { // IND: index (move cursor down, scroll if needed)
+            if (self.grid.cursor_row >= self.grid.scroll_bottom) {
+                self.grid.scrollUp();
+            } else {
+                self.grid.cursor_row += 1;
+            }
+            self.state = .ground;
+        },
+        'M' => { // RI: reverse index (move cursor up, scroll if needed)
+            if (self.grid.cursor_row <= self.grid.scroll_top) {
+                self.grid.scrollDown();
+            } else {
+                self.grid.cursor_row -= 1;
+            }
+            self.state = .ground;
+        },
+        'E' => { // NEL: next line
+            self.grid.newline();
+            self.state = .ground;
+        },
+        'c' => { // RIS: full reset
+            self.grid.clearScreen(2);
+            self.grid.cursor_row = 0;
+            self.grid.cursor_col = 0;
+            self.grid.resetPen();
+            self.grid.scroll_top = 0;
+            self.grid.scroll_bottom = self.grid.rows -| 1;
+            self.cursor_visible = true;
+            self.state = .ground;
+        },
+        else => {
+            // Unknown escape sequence: drop back to ground
+            self.state = .ground;
+        },
+    }
+}
+
+// ── CSI entry (saw ESC[) ─────────────────────────────────────────
+
+fn handleCsiEntry(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        '?' => {
+            self.private_marker = true;
+            self.state = .csi_param;
+        },
+        '0'...'9' => {
+            self.params[0] = byte - '0';
+            self.param_count = 1;
+            self.state = .csi_param;
+        },
+        ';' => {
+            // Empty first param (defaults to 0)
+            self.param_count = 2;
+            self.state = .csi_param;
+        },
+        0x20...0x2F => {
+            self.intermediate = byte;
+            self.state = .csi_intermediate;
+        },
+        0x40...0x7E => {
+            // Final byte with no params
+            self.param_count = 0;
+            self.dispatchCsi(byte);
+            self.state = .ground;
+        },
+        else => {
+            self.state = .ground;
+        },
+    }
+}
+
+// ── CSI param collection ─────────────────────────────────────────
+
+fn handleCsiParam(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        '0'...'9' => {
+            if (self.param_count == 0) self.param_count = 1;
+            const idx = self.param_count - 1;
+            if (idx < MAX_PARAMS) {
+                self.params[idx] = self.params[idx] *| 10 +| (byte - '0');
+            }
+        },
+        ';' => {
+            if (self.param_count < MAX_PARAMS) {
+                self.param_count += 1;
+                if (self.param_count <= MAX_PARAMS) {
+                    self.params[self.param_count - 1] = 0;
+                }
+            }
+        },
+        0x20...0x2F => {
+            self.intermediate = byte;
+            self.state = .csi_intermediate;
+        },
+        0x40...0x7E => {
+            // Final byte
+            self.dispatchCsi(byte);
+            self.state = .ground;
+        },
+        else => {
+            self.state = .ground;
+        },
+    }
+}
+
+// ── CSI intermediate ─────────────────────────────────────────────
+
+fn handleCsiIntermediate(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        0x20...0x2F => {
+            // Another intermediate byte (rare, ignore)
+        },
+        0x40...0x7E => {
+            // Final byte — we don't handle intermediates currently
+            self.state = .ground;
+        },
+        else => {
+            self.state = .ground;
+        },
+    }
+}
+
+// ── OSC string (saw ESC]) ────────────────────────────────────────
+
+fn handleOscString(self: *VtParser, byte: u8) void {
+    switch (byte) {
+        0x07 => { // BEL terminates OSC
+            self.finishOsc();
+            self.state = .ground;
+        },
+        0x1B => {
+            // Might be ST (ESC \) — for simplicity, treat ESC in OSC as terminator
+            self.finishOsc();
+            self.state = .ground;
+        },
+        else => {
+            if (self.osc_len < MAX_OSC_LEN) {
+                self.osc_buf[self.osc_len] = byte;
+                self.osc_len += 1;
+            }
+        },
+    }
+}
+
+fn finishOsc(self: *VtParser) void {
+    if (self.osc_len == 0) return;
+
+    const data = self.osc_buf[0..self.osc_len];
+
+    // Parse OSC 0;title or OSC 2;title
+    if (data.len >= 2 and (data[0] == '0' or data[0] == '2') and data[1] == ';') {
+        const title_data = data[2..];
+        const copy_len = @min(title_data.len, MAX_OSC_LEN);
+        @memcpy(self.title[0..copy_len], title_data[0..copy_len]);
+        self.title_len = @intCast(copy_len);
+    }
+}
+
+// ── CSI dispatch ─────────────────────────────────────────────────
+
+fn resetCsiState(self: *VtParser) void {
+    self.params = [_]u16{0} ** MAX_PARAMS;
+    self.param_count = 0;
+    self.private_marker = false;
+    self.intermediate = 0;
+}
+
+/// Get CSI param with default value.
+fn getParam(self: *const VtParser, idx: u8, default: u16) u16 {
+    if (idx >= self.param_count) return default;
+    const v = self.params[idx];
+    return if (v == 0) default else v;
+}
+
+fn dispatchCsi(self: *VtParser, final: u8) void {
+    if (self.private_marker) {
+        self.dispatchCsiPrivate(final);
+        return;
+    }
+
+    switch (final) {
+        'A' => { // CUU — cursor up
+            const n = self.getParam(0, 1);
+            self.grid.cursor_row -|= n;
+            if (self.grid.cursor_row < self.grid.scroll_top) {
+                self.grid.cursor_row = self.grid.scroll_top;
+            }
+        },
+        'B' => { // CUD — cursor down
+            const n = self.getParam(0, 1);
+            self.grid.cursor_row = @min(self.grid.cursor_row +| n, self.grid.scroll_bottom);
+        },
+        'C' => { // CUF — cursor forward
+            const n = self.getParam(0, 1);
+            self.grid.cursor_col = @min(self.grid.cursor_col +| n, self.grid.cols -| 1);
+        },
+        'D' => { // CUB — cursor back
+            const n = self.getParam(0, 1);
+            self.grid.cursor_col -|= n;
+        },
+        'E' => { // CNL — cursor next line
+            const n = self.getParam(0, 1);
+            self.grid.cursor_row = @min(self.grid.cursor_row +| n, self.grid.scroll_bottom);
+            self.grid.cursor_col = 0;
+        },
+        'F' => { // CPL — cursor previous line
+            const n = self.getParam(0, 1);
+            self.grid.cursor_row -|= n;
+            if (self.grid.cursor_row < self.grid.scroll_top) {
+                self.grid.cursor_row = self.grid.scroll_top;
+            }
+            self.grid.cursor_col = 0;
+        },
+        'G' => { // CHA — cursor horizontal absolute (1-based)
+            const col = self.getParam(0, 1);
+            self.grid.cursor_col = if (col == 0) 0 else @min(col - 1, self.grid.cols -| 1);
+        },
+        'H', 'f' => { // CUP / HVP — cursor position (1-based)
+            const row = self.getParam(0, 1);
+            const col = self.getParam(1, 1);
+            self.grid.setCursorPos(row, col);
+        },
+        'J' => { // ED — erase display
+            const mode: u8 = @intCast(self.getParam(0, 0));
+            self.grid.clearScreen(mode);
+        },
+        'K' => { // EL — erase line
+            const mode: u8 = @intCast(self.getParam(0, 0));
+            self.grid.clearLine(self.grid.cursor_row, mode);
+        },
+        'S' => { // SU — scroll up
+            const n = self.getParam(0, 1);
+            self.grid.scrollUpN(n);
+        },
+        'T' => { // SD — scroll down
+            const n = self.getParam(0, 1);
+            self.grid.scrollDownN(n);
+        },
+        'd' => { // VPA — vertical position absolute (1-based)
+            const row = self.getParam(0, 1);
+            self.grid.cursor_row = if (row == 0) 0 else @min(row - 1, self.grid.rows -| 1);
+        },
+        'm' => { // SGR — select graphic rendition
+            self.dispatchSgr();
+        },
+        'r' => { // DECSTBM — set scroll region
+            const top = self.getParam(0, 1);
+            const bottom = self.getParam(1, self.grid.rows);
+            self.grid.scroll_top = if (top == 0) 0 else @min(top - 1, self.grid.rows -| 1);
+            self.grid.scroll_bottom = if (bottom == 0) 0 else @min(bottom - 1, self.grid.rows -| 1);
+            // Ensure top < bottom
+            if (self.grid.scroll_top >= self.grid.scroll_bottom) {
+                self.grid.scroll_top = 0;
+                self.grid.scroll_bottom = self.grid.rows -| 1;
+            }
+            // Move cursor to home
+            self.grid.cursor_row = 0;
+            self.grid.cursor_col = 0;
+        },
+        's' => { // SCP — save cursor position
+            self.grid.saveCursor();
+        },
+        'u' => { // RCP — restore cursor position
+            self.grid.restoreCursor();
+        },
+        else => {
+            // Unknown CSI final byte: ignore
+        },
+    }
+}
+
+fn dispatchCsiPrivate(self: *VtParser, final: u8) void {
+    const mode = self.getParam(0, 0);
+    switch (final) {
+        'h' => { // DECSET
+            switch (mode) {
+                25 => self.cursor_visible = true, // show cursor
+                1049 => { // alt screen on
+                    self.alt_screen = true;
+                    self.grid.saveCursor();
+                    self.grid.clearScreen(2);
+                    self.grid.cursor_row = 0;
+                    self.grid.cursor_col = 0;
+                },
+                else => {},
+            }
+        },
+        'l' => { // DECRST
+            switch (mode) {
+                25 => self.cursor_visible = false, // hide cursor
+                1049 => { // alt screen off
+                    self.alt_screen = false;
+                    self.grid.restoreCursor();
+                },
+                else => {},
+            }
+        },
+        else => {},
+    }
+}
+
+// ── SGR dispatch ─────────────────────────────────────────────────
+
+fn dispatchSgr(self: *VtParser) void {
+    if (self.param_count == 0) {
+        // ESC[m with no params = reset
+        self.grid.resetPen();
+        return;
+    }
+
+    var i: u8 = 0;
+    while (i < self.param_count) {
+        const p = self.params[i];
+        switch (p) {
+            0 => self.grid.resetPen(),
+            1 => self.grid.pen_attrs.bold = true,
+            2 => self.grid.pen_attrs.dim = true,
+            3 => self.grid.pen_attrs.italic = true,
+            4 => self.grid.pen_attrs.underline = true,
+            5 => self.grid.pen_attrs.blink = true,
+            7 => self.grid.pen_attrs.inverse = true,
+            8 => self.grid.pen_attrs.hidden = true,
+            9 => self.grid.pen_attrs.strikethrough = true,
+            22 => {
+                self.grid.pen_attrs.bold = false;
+                self.grid.pen_attrs.dim = false;
+            },
+            23 => self.grid.pen_attrs.italic = false,
+            24 => self.grid.pen_attrs.underline = false,
+            25 => self.grid.pen_attrs.blink = false,
+            27 => self.grid.pen_attrs.inverse = false,
+            28 => self.grid.pen_attrs.hidden = false,
+            29 => self.grid.pen_attrs.strikethrough = false,
+            // Standard foreground colors (30-37)
+            30...37 => self.grid.pen_fg = .{ .indexed = @intCast(p - 30) },
+            // Standard background colors (40-47)
+            40...47 => self.grid.pen_bg = .{ .indexed = @intCast(p - 40) },
+            39 => self.grid.pen_fg = .default, // default fg
+            49 => self.grid.pen_bg = .default, // default bg
+            // Bright foreground (90-97)
+            90...97 => self.grid.pen_fg = .{ .indexed = @intCast(p - 90 + 8) },
+            // Bright background (100-107)
+            100...107 => self.grid.pen_bg = .{ .indexed = @intCast(p - 100 + 8) },
+            // Extended color: 38;5;N or 38;2;R;G;B
+            38 => {
+                i = self.parseExtendedColor(i, true);
+                continue;
+            },
+            48 => {
+                i = self.parseExtendedColor(i, false);
+                continue;
+            },
+            else => {}, // Unknown SGR param: ignore
+        }
+        i += 1;
+    }
+}
+
+/// Parse extended color (256-color or truecolor).
+/// Returns the new index to continue from.
+fn parseExtendedColor(self: *VtParser, start: u8, is_fg: bool) u8 {
+    var i = start + 1;
+    if (i >= self.param_count) return i;
+
+    const sub = self.params[i];
+    switch (sub) {
+        5 => { // 256-color: 38;5;N
+            i += 1;
+            if (i >= self.param_count) return i;
+            const color_idx: u8 = @intCast(@min(self.params[i], 255));
+            if (is_fg) {
+                self.grid.pen_fg = .{ .indexed = color_idx };
+            } else {
+                self.grid.pen_bg = .{ .indexed = color_idx };
+            }
+            return i + 1;
+        },
+        2 => { // Truecolor: 38;2;R;G;B
+            i += 1;
+            if (i + 2 >= self.param_count) return i;
+            const r: u8 = @intCast(@min(self.params[i], 255));
+            const g: u8 = @intCast(@min(self.params[i + 1], 255));
+            const b_val: u8 = @intCast(@min(self.params[i + 2], 255));
+            if (is_fg) {
+                self.grid.pen_fg = .{ .rgb = .{ .r = r, .g = g, .b = b_val } };
+            } else {
+                self.grid.pen_bg = .{ .rgb = .{ .r = r, .g = g, .b = b_val } };
+            }
+            return i + 3;
+        },
+        else => return i + 1,
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+test "plain text" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("Hello");
+
+    try std.testing.expectEqual(@as(u21, 'H'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'e'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'o'), grid.cellAtConst(0, 4).char);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 5), grid.cursor_col);
+}
+
+test "CR and LF" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("AB\r\nCD");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'D'), grid.cellAtConst(1, 1).char);
+}
+
+test "backspace" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("AB\x08C");
+
+    // 'A' at 0, 'B' at 1, BS moves back to 1, 'C' overwrites 'B'
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(0, 1).char);
+}
+
+test "tab stops" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("A\tB");
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 8).char);
+}
+
+test "CSI cursor movement" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Move cursor to row 5, col 10 (1-based)
+    parser.feed("\x1b[5;10H");
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+
+    // Cursor up 2
+    parser.feed("\x1b[2A");
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+
+    // Cursor down 1
+    parser.feed("\x1b[B");
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_row);
+
+    // Cursor forward 5
+    parser.feed("\x1b[5C");
+    try std.testing.expectEqual(@as(u16, 14), grid.cursor_col);
+
+    // Cursor back 3
+    parser.feed("\x1b[3D");
+    try std.testing.expectEqual(@as(u16, 11), grid.cursor_col);
+}
+
+test "CSI cursor position home" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("Hello\x1b[H");
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+}
+
+test "SGR basic attributes" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Bold + italic on
+    parser.feed("\x1b[1;3mA");
+    const cell_a = grid.cellAtConst(0, 0);
+    try std.testing.expect(cell_a.attrs.bold);
+    try std.testing.expect(cell_a.attrs.italic);
+
+    // Reset
+    parser.feed("\x1b[0mB");
+    const cell_b = grid.cellAtConst(0, 1);
+    try std.testing.expect(!cell_b.attrs.bold);
+    try std.testing.expect(!cell_b.attrs.italic);
+}
+
+test "SGR standard colors" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Red foreground (31), blue background (44)
+    parser.feed("\x1b[31;44mX");
+    const cell = grid.cellAtConst(0, 0);
+    try std.testing.expectEqual(Grid.Color{ .indexed = 1 }, cell.fg);
+    try std.testing.expectEqual(Grid.Color{ .indexed = 4 }, cell.bg);
+}
+
+test "SGR 256-color" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // 256-color foreground: index 208 (orange)
+    parser.feed("\x1b[38;5;208mA");
+    const cell = grid.cellAtConst(0, 0);
+    try std.testing.expectEqual(Grid.Color{ .indexed = 208 }, cell.fg);
+}
+
+test "SGR truecolor" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Truecolor foreground: RGB(255, 128, 0)
+    parser.feed("\x1b[38;2;255;128;0mA");
+    const cell = grid.cellAtConst(0, 0);
+    try std.testing.expectEqual(Grid.Color{ .rgb = .{ .r = 255, .g = 128, .b = 0 } }, cell.fg);
+}
+
+test "erase display" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("ABCDE\r\nFGHIJ\r\nKLMNO");
+
+    // ESC[2J — clear entire screen
+    parser.feed("\x1b[2J");
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(1, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(2, 4).char);
+}
+
+test "erase line" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("ABCDE");
+    // Move cursor to column 2
+    parser.feed("\x1b[1;3H");
+    // ESC[K — erase from cursor to end of line (mode 0)
+    parser.feed("\x1b[K");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+}
+
+test "scroll up and down" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(1, 0).char = 'B';
+    grid.cellAt(2, 0).char = 'C';
+
+    // ESC[S — scroll up
+    parser.feed("\x1b[S");
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(2, 0).char);
+
+    // ESC[T — scroll down
+    parser.feed("\x1b[T");
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(2, 0).char);
+}
+
+test "cursor save and restore via CSI" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("\x1b[5;10H"); // Move to (4,9)
+    parser.feed("\x1b[s"); // Save
+    parser.feed("\x1b[1;1H"); // Move to (0,0)
+    parser.feed("\x1b[u"); // Restore
+
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+}
+
+test "cursor save and restore via DEC" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("\x1b[5;10H"); // Move to (4,9)
+    parser.feed("\x1b" ++ "7"); // ESC 7 — save
+    parser.feed("\x1b[1;1H"); // Move to (0,0)
+    parser.feed("\x1b" ++ "8"); // ESC 8 — restore
+
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+}
+
+test "cursor visibility" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    try std.testing.expect(parser.cursor_visible);
+
+    parser.feed("\x1b[?25l"); // Hide
+    try std.testing.expect(!parser.cursor_visible);
+
+    parser.feed("\x1b[?25h"); // Show
+    try std.testing.expect(parser.cursor_visible);
+}
+
+test "alt screen" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("Hello"); // Write some text
+    parser.feed("\x1b[5;10H"); // Move cursor
+
+    parser.feed("\x1b[?1049h"); // Alt screen on
+    try std.testing.expect(parser.alt_screen);
+    // Screen should be cleared
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 0).char);
+
+    parser.feed("\x1b[?1049l"); // Alt screen off
+    try std.testing.expect(!parser.alt_screen);
+    // Cursor should be restored to saved position (4, 9)
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+}
+
+test "OSC title" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("\x1b]0;My Terminal Title\x07");
+    const expected = "My Terminal Title";
+    try std.testing.expectEqualSlices(u8, expected, parser.title[0..parser.title_len]);
+}
+
+test "SGR reset with no params" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    parser.feed("\x1b[1mA"); // Bold
+    try std.testing.expect(grid.cellAtConst(0, 0).attrs.bold);
+
+    parser.feed("\x1b[mB"); // Reset (no params)
+    try std.testing.expect(!grid.cellAtConst(0, 1).attrs.bold);
+}
+
+test "multiple CSI params" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Bold + underline + red fg + blue bg in one sequence
+    parser.feed("\x1b[1;4;31;44mX");
+    const cell = grid.cellAtConst(0, 0);
+    try std.testing.expect(cell.attrs.bold);
+    try std.testing.expect(cell.attrs.underline);
+    try std.testing.expectEqual(Grid.Color{ .indexed = 1 }, cell.fg);
+    try std.testing.expectEqual(Grid.Color{ .indexed = 4 }, cell.bg);
+}
+
+test "scroll region" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 5, 4);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Set scroll region to rows 2-4 (1-based)
+    parser.feed("\x1b[2;4r");
+    try std.testing.expectEqual(@as(u16, 1), grid.scroll_top);
+    try std.testing.expectEqual(@as(u16, 3), grid.scroll_bottom);
+    // Cursor should go home
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+}
