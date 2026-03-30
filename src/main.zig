@@ -138,8 +138,16 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // DA1 response is sent proactively in Multiplexer.spawnPane() —
-    // no need for early PTY reads here.
+    // Early PTY reads to catch shell startup queries (DA1, DSR, XTGETTCAP).
+    // The VtParser responds to ESC[c with ESC[?62;22c via response_fd.
+    // Must happen after linkVt() so response_fd is set.
+    if (mux.getActivePane()) |pane| {
+        for (0..20) |_| {
+            const n = pane.readAndProcess(&pty_buf) catch 0;
+            if (n > 0) break; // Got data — responses are being sent
+            io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
 
     while (running) {
         // Check prefix timeout

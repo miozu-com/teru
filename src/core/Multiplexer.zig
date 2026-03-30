@@ -59,13 +59,7 @@ pub fn spawnPane(self: *Multiplexer, rows: u16, cols: u16) !u64 {
     errdefer _ = self.panes.pop();
 
     // Patch VtParser's grid pointer now that Pane is in its final memory location
-    const new_pane = &self.panes.items[self.panes.items.len - 1];
-    new_pane.linkVt();
-
-    // Proactively write DA1 response to PTY before shell starts querying.
-    // Fish sends ESC[c immediately on startup and waits 2s for a reply.
-    // Writing now puts the response in the PTY buffer before exec completes.
-    _ = new_pane.pty.write("\x1b[?62;22c") catch {}; // DA1: VT220 + ANSI color
+    self.panes.items[self.panes.items.len - 1].linkVt();
 
     try self.layout_engine.workspaces[self.active_workspace].addNode(self.allocator, id);
 
