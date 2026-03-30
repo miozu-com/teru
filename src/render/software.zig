@@ -82,6 +82,7 @@ pub const SoftwareRenderer = struct {
     atlas_width: u32,
     atlas_height: u32,
     cursor_color: u32, // configurable cursor block color (ARGB)
+    padding: u32, // pixels of padding around content
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -119,6 +120,7 @@ pub const SoftwareRenderer = struct {
             .atlas_width = 0,
             .atlas_height = 0,
             .cursor_color = cursor_color,
+            .padding = 4, // 4px content padding
             .allocator = allocator,
         };
     }
@@ -138,11 +140,11 @@ pub const SoftwareRenderer = struct {
         const fb_h: usize = self.height;
 
         for (0..rows) |row| {
-            const screen_y = row * ch;
+            const screen_y = row * ch + self.padding;
             if (screen_y >= fb_h) break;
 
             for (0..cols) |col| {
-                const screen_x = col * cw;
+                const screen_x = col * cw + self.padding;
                 if (screen_x >= fb_w) break;
 
                 const cell = grid.cellAtConst(@intCast(row), @intCast(col));
@@ -195,8 +197,8 @@ pub const SoftwareRenderer = struct {
         // NOTE: Grid does not yet track cursor_visible (ESC[?25h/l).
         // When that field is added, gate this block on it.
         if (grid.cursor_row < grid.rows and grid.cursor_col < grid.cols) {
-            const cx: usize = @as(usize, grid.cursor_col) * cw;
-            const cy: usize = @as(usize, grid.cursor_row) * ch;
+            const cx: usize = @as(usize, grid.cursor_col) * cw + self.padding;
+            const cy: usize = @as(usize, grid.cursor_row) * ch + self.padding;
             const cursor_color: u32 = self.cursor_color;
 
             const cursor_max_y = @min(cy + ch, fb_h);
@@ -395,6 +397,7 @@ test "render empty grid" {
     defer grid.deinit(allocator);
 
     var renderer = try SoftwareRenderer.init(allocator, 32, 48, 8, 16);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
 
     renderer.render(&grid);
@@ -448,6 +451,7 @@ test "render single character" {
     atlas_data[1 * atlas_w + 67] = 255; // row 1, col 1
 
     var renderer = try SoftwareRenderer.init(allocator, 2, 2, cw, ch);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
     renderer.updateAtlas(atlas_data, atlas_w, atlas_h);
 
@@ -489,6 +493,7 @@ test "render colored text" {
     atlas_data[1 * atlas_w + 113] = 255; // full fg
 
     var renderer = try SoftwareRenderer.init(allocator, 2, 2, cw, ch);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
     renderer.updateAtlas(atlas_data, atlas_w, atlas_h);
 
@@ -519,6 +524,7 @@ test "framebuffer dimensions" {
     const allocator = std.testing.allocator;
 
     var renderer = try SoftwareRenderer.init(allocator, 640, 480, 8, 16);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
 
     try std.testing.expectEqual(@as(usize, 640 * 480), renderer.framebuffer.len);
@@ -555,6 +561,7 @@ test "performance: 5000 cells" {
     const fb_h: u32 = 50 * ch; // 800
 
     var renderer = try SoftwareRenderer.init(allocator, fb_w, fb_h, cw, ch);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
 
     // No atlas — tests pure fill performance (no glyph blitting)
@@ -603,6 +610,7 @@ test "cursor rendered as block at cursor position" {
     const cw: u32 = 2;
     const ch: u32 = 2;
     var renderer = try SoftwareRenderer.init(allocator, 4 * cw, 3 * ch, cw, ch);
+    renderer.padding = 0; // tests expect no padding
     defer renderer.deinit();
 
     renderer.render(&grid);

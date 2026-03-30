@@ -89,8 +89,9 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     defer renderer.deinit();
     renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
 
-    const grid_cols: u16 = @intCast(config.initial_width / atlas.cell_width);
-    const grid_rows: u16 = @intCast(config.initial_height / atlas.cell_height);
+    const padding: u32 = 4; // must match SoftwareRenderer.padding
+    const grid_cols: u16 = @intCast((config.initial_width -| padding * 2) / atlas.cell_width);
+    const grid_rows: u16 = @intCast((config.initial_height -| padding * 2) / atlas.cell_height);
 
     // Multiplexer: manages all panes (linked to process graph for agent rendering)
     var mux = Multiplexer.init(allocator);
@@ -136,6 +137,12 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     _ = &mouse_down;
     var pty_buf: [8192]u8 = undefined;
     var running = true;
+
+    // Do an early PTY read to catch shell startup queries (DA1, DSR)
+    // before entering the event loop. Prevents fish 2-second timeout.
+    if (mux.getActivePane()) |pane| {
+        _ = pane.readAndProcess(&pty_buf) catch {};
+    }
 
     while (running) {
         // Check prefix timeout
@@ -226,10 +233,14 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                 .mouse_press => |mouse| {
                     switch (mouse.button) {
                         .left => {
-                            // Start text selection
-                            const col: u16 = @intCast(mouse.x / atlas.cell_width);
-                            const row: u16 = @intCast(mouse.y / atlas.cell_height);
-                            selection.clear();
+                            // Clear any existing selection on click
+                            if (selection.active) {
+                                selection.clear();
+                                if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                            }
+                            // Record click position for potential drag selection
+                            const col: u16 = @intCast(@min(mouse.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
+                            const row: u16 = @intCast(@min(mouse.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
                             selection.begin(row, col);
                             mouse_down = true;
                         },
@@ -251,18 +262,23 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                 .mouse_release => |mouse| {
                     if (mouse.button == .left and mouse_down) {
                         mouse_down = false;
-                        const col: u16 = @intCast(mouse.x / atlas.cell_width);
-                        const row: u16 = @intCast(mouse.y / atlas.cell_height);
+                        const col: u16 = @intCast(@min(mouse.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
+                        const row: u16 = @intCast(@min(mouse.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
                         selection.update(row, col);
-                        selection.finish();
 
-                        // Copy selected text to clipboard
-                        if (mux.getActivePane()) |pane| {
-                            var sel_buf: [8192]u8 = undefined;
-                            const len = selection.getText(&pane.grid, &sel_buf);
-                            if (len > 0) {
-                                Clipboard.copy(sel_buf[0..len]);
+                        // Only finalize selection if mouse actually moved (not a single click)
+                        if (selection.start_row != selection.end_row or selection.start_col != selection.end_col) {
+                            selection.finish();
+                            if (mux.getActivePane()) |pane| {
+                                var sel_buf: [8192]u8 = undefined;
+                                const len = selection.getText(&pane.grid, &sel_buf);
+                                if (len > 0) {
+                                    Clipboard.copy(sel_buf[0..len]);
+                                }
                             }
+                        } else {
+                            // Single click: clear selection (already cleared on press)
+                            selection.clear();
                         }
                     }
                 },

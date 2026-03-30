@@ -184,12 +184,10 @@ pub fn renderAllWithSelection(
 
     const active_id = ws.getActiveNodeId();
 
-    // Reserve bottom bar height (only if screen is tall enough)
-    const bar_height: u16 = 20;
-    const effective_height: u16 = if (screen_height > bar_height + 40)
-        @intCast(screen_height - bar_height)
-    else
-        @intCast(screen_height);
+    // Reserve bottom bar height only when agents are active
+    const has_agents = if (self.graph) |g| g.countAgentsByState().running + g.countAgentsByState().done + g.countAgentsByState().failed > 0 else false;
+    const bar_height: u16 = if (has_agents and screen_height > 60) 20 else 0;
+    const effective_height: u16 = @intCast(screen_height -| bar_height);
 
     for (rects, 0..) |rect, i| {
         if (i >= node_ids.len) break;
