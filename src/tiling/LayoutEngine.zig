@@ -37,7 +37,7 @@ pub const Workspace = struct {
         return .{
             .name = name,
             .layout = .monocle,
-            .node_ids = .{},
+            .node_ids = .empty,
         };
     }
 

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const Config = @This();
 
 // ── Fields ────────────────────────────────────────────────────────
@@ -54,16 +55,13 @@ allocator: Allocator,
 pub fn load(allocator: Allocator) !Config {
     var config = Config{ .allocator = allocator };
 
-    const home = std.posix.getenv("HOME") orelse return config;
+    const home = if (std.c.getenv("HOME")) |ptr| std.mem.sliceTo(ptr, 0) else return config;
 
     // Build path: $HOME/.config/teru/teru.conf
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/.config/teru/teru.conf", .{home}) catch return config;
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return config,
-        else => return config,
-    };
+    const file = compat.openFile(path, .{}) catch return config;
     defer file.close();
 
     // Read the entire file (cap at 64KB — config files should be tiny)

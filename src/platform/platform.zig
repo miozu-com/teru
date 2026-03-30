@@ -12,9 +12,11 @@ pub const MouseButton = @import("types.zig").MouseButton;
 pub const MouseEvent = @import("types.zig").MouseEvent;
 pub const Size = @import("types.zig").Size;
 
-pub const Platform = switch (builtin.os.tag) {
-    .linux => @import("linux/platform.zig").Platform,
-    .macos => @import("macos/platform.zig").Platform,
-    .windows => @import("windows/platform.zig").Platform,
-    else => @compileError("unsupported platform: " ++ @tagName(builtin.os.tag)),
-};
+pub const Platform = if (builtin.os.tag == .linux)
+    @import("linux/platform.zig").Platform
+else if (builtin.os.tag == .macos)
+    @import("macos/platform.zig").Platform
+else if (builtin.os.tag == .windows)
+    @import("windows/platform.zig").Platform
+else
+    @compileError("unsupported platform: " ++ @tagName(builtin.os.tag));

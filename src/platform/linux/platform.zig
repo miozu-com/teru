@@ -46,7 +46,7 @@ const DualPlatform = union(enum) {
     wayland_: wayland.WaylandWindow,
 
     pub fn init(width: u32, height: u32, title: []const u8) !DualPlatform {
-        if (std.posix.getenv("WAYLAND_DISPLAY")) |_| {
+        if (std.c.getenv("WAYLAND_DISPLAY")) |_| {
             if (wayland.WaylandWindow.init(width, height, title)) |w| {
                 return .{ .wayland_ = w };
             } else |_| {}

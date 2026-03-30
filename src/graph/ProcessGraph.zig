@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const compat = @import("../compat.zig");
 const ProcessGraph = @This();
 
 pub const NodeId = u64;
@@ -36,7 +37,7 @@ pub const Node = struct {
 
     // Graph edges
     parent: ?NodeId = null,
-    children: std.ArrayListUnmanaged(NodeId) = .{},
+    children: std.ArrayListUnmanaged(NodeId) = .empty,
 
     // Process info
     pid: ?std.posix.pid_t = null,
@@ -60,7 +61,7 @@ pub const Node = struct {
 allocator: Allocator,
 nodes: std.AutoHashMapUnmanaged(NodeId, Node),
 next_id: NodeId = 1,
-root_nodes: std.ArrayListUnmanaged(NodeId) = .{},
+root_nodes: std.ArrayListUnmanaged(NodeId) = .empty,
 
 pub fn init(allocator: Allocator) ProcessGraph {
     return .{
@@ -98,7 +99,7 @@ pub fn spawn(self: *ProcessGraph, opts: struct {
         .state = .running,
         .parent = opts.parent,
         .pid = opts.pid,
-        .started_at = std.time.nanoTimestamp(),
+        .started_at = compat.nanoTimestamp(),
         .agent = opts.agent,
         .workspace = opts.workspace,
     };
@@ -113,7 +114,7 @@ pub fn spawn(self: *ProcessGraph, opts: struct {
     }
 
     // Initialize children list
-    node.children = .{};
+    node.children = .empty;
 
     try self.nodes.put(self.allocator, id, node);
     return id;
@@ -152,7 +153,7 @@ pub fn markFinished(self: *ProcessGraph, id: NodeId, exit_code: u8) void {
     if (self.nodes.getPtr(id)) |node| {
         node.state = .finished;
         node.exit_code = exit_code;
-        node.ended_at = std.time.nanoTimestamp();
+        node.ended_at = compat.nanoTimestamp();
     }
 }
 

@@ -10,10 +10,9 @@ One binary replaces Alacritty + tmux + terminal management in your window manage
 
 ## Build
 
-```bash
-# Arch Linux
-sudo pacman -S zig
+Requires **Zig 0.16+** (0.16-dev or later).
 
+```bash
 # Build and run
 zig build run
 

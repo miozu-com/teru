@@ -24,7 +24,7 @@ next_pane_id: u64,
 
 pub fn init(allocator: Allocator) Multiplexer {
     return .{
-        .panes = .{},
+        .panes = .empty,
         .layout_engine = LayoutEngine.init(allocator),
         .active_workspace = 0,
         .allocator = allocator,

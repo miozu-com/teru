@@ -565,16 +565,16 @@ pub const WaylandWindow = struct {
         // Create anonymous file via memfd_create
         const fd = memfdCreate("teru-shm");
         if (fd < 0) return error.MemfdCreateFailed;
-        errdefer std.posix.close(fd);
+        errdefer _ = std.posix.system.close(fd);
 
         // Set size
-        std.posix.ftruncate(fd, @intCast(size)) catch return error.FtruncateFailed;
+        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.FtruncateFailed;
 
         // mmap the buffer
         const mapped = std.posix.mmap(
             null,
             size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
             0,
@@ -624,7 +624,7 @@ pub const WaylandWindow = struct {
             self.shm_data = null;
         }
         if (self.shm_fd >= 0) {
-            std.posix.close(self.shm_fd);
+            _ = std.posix.system.close(self.shm_fd);
             self.shm_fd = -1;
         }
         self.shm_size = 0;
@@ -822,7 +822,7 @@ fn keyboardKeymap(
     _: u32,
 ) callconv(.c) void {
     // Close the keymap fd — we pass raw keycodes for now (xkbcommon later)
-    if (fd >= 0) std.posix.close(@intCast(fd));
+    if (fd >= 0) _ = std.posix.system.close(@intCast(fd));
 }
 
 fn keyboardEnter(

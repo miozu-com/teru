@@ -21,9 +21,10 @@ pub fn init(allocator: Allocator, rows: u16, cols: u16, id: u64) !Pane {
     var pty = try Pty.spawn(.{ .rows = rows, .cols = cols });
     errdefer pty.deinit();
 
-    // Set PTY to non-blocking
-    const flags = try posix.fcntl(pty.master, posix.F.GETFL, 0);
-    _ = try posix.fcntl(pty.master, posix.F.SETFL, flags | 0x800);
+    // Set PTY to non-blocking via C fcntl (posix.fcntl removed in 0.16)
+    const flags = std.c.fcntl(pty.master, posix.F.GETFL);
+    if (flags < 0) return error.FcntlFailed;
+    _ = std.c.fcntl(pty.master, posix.F.SETFL, flags | 0x800);
 
     return .{
         .pty = pty,

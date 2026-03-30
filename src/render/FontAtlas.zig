@@ -5,6 +5,7 @@
 //! or accepting an explicit font path. No FreeType, no fontconfig.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const FontAtlas = @This();
 
 // ── stb_truetype C bindings ────────────────────────────────────────
@@ -190,21 +191,22 @@ fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
     for (font_search_paths) |dir| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, font_name });
-            if (std.fs.cwd().access(path, .{})) |_| {
+            if (compat.access(path)) {
                 return path;
-            } else |_| {
+            } else {
                 allocator.free(path);
             }
         }
     }
 
     // Try HOME/.local/share/fonts
-    if (std.posix.getenv("HOME")) |home| {
+    if (std.c.getenv("HOME")) |home_ptr| {
+        const home = std.mem.sliceTo(home_ptr, 0);
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/.local/share/fonts/{s}", .{ home, font_name });
-            if (std.fs.cwd().access(path, .{})) |_| {
+            if (compat.access(path)) {
                 return path;
-            } else |_| {
+            } else {
                 allocator.free(path);
             }
         }
@@ -214,12 +216,12 @@ fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn loadFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try compat.openFile(path, .{});
     defer file.close();
-    const stat = try file.stat();
-    const data = try allocator.alloc(u8, stat.size);
+    const s = try file.stat();
+    const data = try allocator.alloc(u8, s.size);
     const n = try file.readAll(data);
-    if (n != stat.size) {
+    if (n != s.size) {
         allocator.free(data);
         return error.IncompleteRead;
     }

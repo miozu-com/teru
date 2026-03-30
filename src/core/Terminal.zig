@@ -95,7 +95,7 @@ pub fn runLoop(self: *Terminal, pty: *const Pty) !void {
         if (fds[1].revents & POLLIN != 0) {
             const n = pty.read(&buf) catch break;
             if (n == 0) break;
-            _ = posix.write(posix.STDOUT_FILENO, buf[0..n]) catch break;
+            _ = std.c.write(posix.STDOUT_FILENO, &buf, n);
         }
         if (fds[1].revents & (POLLHUP | POLLERR) != 0) break;
     }

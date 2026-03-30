@@ -90,13 +90,12 @@ fn MsgSendType(comptime Ret: type, comptime ArgsTuple: type) type {
     for (args_info, 0..) |field, i| {
         params[base_count + i] = .{ .is_generic = false, .is_noalias = false, .type = field.type };
     }
-    return @Type(.{ .@"fn" = .{
-        .calling_convention = .c,
-        .is_generic = false,
-        .is_var_args = false,
-        .return_type = Ret,
-        .params = &params,
-    } });
+    // @Type was removed in Zig 0.16 — this code is macOS-only and
+    // will be updated when @Type's replacement is stabilized.
+    // On non-macOS, this function is never called.
+    _ = &params;
+    _ = Ret;
+    @compileError("macOS platform backend requires @Type builtin (removed in Zig 0.16)");
 }
 
 // ── Cocoa constants ─────────────────────────────────────────────────

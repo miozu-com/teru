@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ProcessGraph = @import("../graph/ProcessGraph.zig");
+const compat = @import("../compat.zig");
 
 const Session = @This();
 
@@ -65,7 +66,7 @@ pub fn serialize(graph: *const ProcessGraph, writer: anytype) !void {
     try writer.writeInt(u16, format_version, .little);
 
     // Timestamp
-    const now: i128 = std.time.nanoTimestamp();
+    const now: i128 = compat.nanoTimestamp();
     try writer.writeInt(i128, now, .little);
 
     // Node count
@@ -293,34 +294,33 @@ fn deserializeNode(reader: anytype, allocator: Allocator) !SerializedNode {
 // ── File operations ─────────────────────────────────────────────
 
 /// Serialize the graph and write to a file at the given path.
-/// Allocates a dynamic buffer to handle graphs of any size.
 pub fn saveToFile(graph: *const ProcessGraph, path: []const u8) !void {
-    // Serialize to dynamic memory buffer (allocator-per-call unmanaged list)
-    var list: std.ArrayListAligned(u8, null) = .{};
-    defer list.deinit(std.heap.page_allocator);
-    try serialize(graph, list.writer(std.heap.page_allocator));
+    // Serialize to dynamic memory buffer
+    var dyn = compat.DynWriter{ .allocator = std.heap.page_allocator };
+    defer dyn.deinit();
+    try serialize(graph, &dyn);
 
     // Write to file
-    const file = try std.fs.cwd().createFile(path, .{});
+    const file = try compat.createFile(path, .{});
     defer file.close();
-    try file.writeAll(list.items);
+    try file.writeAll(dyn.getWritten());
 }
 
 /// Read a session from a file at the given path.
 /// Caller owns the returned Session and must call deinit().
 pub fn loadFromFile(path: []const u8, allocator: Allocator) !Session {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try compat.openFile(path, .{});
     defer file.close();
 
     // Read file into dynamic buffer
-    const stat = try file.stat();
-    const data = try allocator.alloc(u8, stat.size);
+    const s = try file.stat();
+    const data = try allocator.alloc(u8, s.size);
     defer allocator.free(data);
     const n = try file.readAll(data);
 
     // Deserialize from memory
-    var stream = std.io.fixedBufferStream(data[0..n]);
-    return deserialize(stream.reader(), allocator);
+    var reader = compat.MemReader{ .buffer = data[0..n] };
+    return deserialize(&reader, allocator);
 }
 
 // ── Session directory ───────────────────────────────────────────
@@ -329,12 +329,12 @@ pub fn loadFromFile(path: []const u8, allocator: Allocator) !Session {
 /// Checks $XDG_STATE_HOME/teru/sessions/ first, falls back to ~/.local/state/teru/sessions/.
 /// Caller owns the returned slice.
 pub fn getSessionDir(allocator: Allocator) ![]const u8 {
-    const xdg = std.posix.getenv("XDG_STATE_HOME");
-    if (xdg) |state_home| {
+    if (std.c.getenv("XDG_STATE_HOME")) |ptr| {
+        const state_home = std.mem.sliceTo(ptr, 0);
         return std.fmt.allocPrint(allocator, "{s}/teru/sessions", .{state_home});
     }
 
-    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home = if (std.c.getenv("HOME")) |ptr| std.mem.sliceTo(ptr, 0) else return error.NoHomeDir;
     return std.fmt.allocPrint(allocator, "{s}/.local/state/teru/sessions", .{home});
 }
 
@@ -356,13 +356,13 @@ test "serialize and deserialize empty graph" {
 
     // Serialize
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try serialize(&graph, stream.writer());
+    var writer = compat.MemWriter{ .buffer = &buf };
+    try serialize(&graph, &writer);
 
     // Deserialize
-    const written = stream.getWritten();
-    var read_stream = std.io.fixedBufferStream(written);
-    var session = try deserialize(read_stream.reader(), allocator);
+    const written = writer.getWritten();
+    var reader = compat.MemReader{ .buffer = written };
+    var session = try deserialize(&reader, allocator);
     defer session.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), session.graph_snapshot.len);
@@ -404,13 +404,13 @@ test "serialize and deserialize graph with 5 mixed nodes" {
 
     // Serialize
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try serialize(&graph, stream.writer());
+    var writer = compat.MemWriter{ .buffer = &buf };
+    try serialize(&graph, &writer);
 
     // Deserialize
-    const written = stream.getWritten();
-    var read_stream = std.io.fixedBufferStream(written);
-    var session = try deserialize(read_stream.reader(), allocator);
+    const written = writer.getWritten();
+    var reader = compat.MemReader{ .buffer = written };
+    var session = try deserialize(&reader, allocator);
     defer session.deinit();
 
     try std.testing.expectEqual(@as(usize, 5), session.graph_snapshot.len);
@@ -475,13 +475,13 @@ test "agent metadata round-trip" {
 
     // Serialize
     var buf: [2048]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try serialize(&graph, stream.writer());
+    var writer = compat.MemWriter{ .buffer = &buf };
+    try serialize(&graph, &writer);
 
     // Deserialize
-    const written = stream.getWritten();
-    var read_stream = std.io.fixedBufferStream(written);
-    var session = try deserialize(read_stream.reader(), allocator);
+    const written = writer.getWritten();
+    var reader = compat.MemReader{ .buffer = written };
+    var session = try deserialize(&reader, allocator);
     defer session.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), session.graph_snapshot.len);
@@ -546,5 +546,5 @@ test "file save and load round-trip" {
     try std.testing.expect(found_lead);
 
     // Clean up temp file
-    std.fs.cwd().deleteFile(tmp_path) catch {};
+    compat.deleteFile("/tmp/teru-session-test.bin");
 }

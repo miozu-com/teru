@@ -90,8 +90,8 @@ pub fn init(allocator: Allocator, config: Config) Scrollback {
     return .{
         .allocator = allocator,
         .keyframe_interval = config.keyframe_interval,
-        .keyframes = .{},
-        .deltas = .{},
+        .keyframes = .empty,
+        .deltas = .empty,
         .total_lines = 0,
         .total_bytes_stored = 0,
         .total_bytes_equivalent = 0,

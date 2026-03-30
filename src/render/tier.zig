@@ -28,8 +28,8 @@ pub const RenderTier = enum {
 
 /// Detect the best rendering tier for the current environment.
 pub fn detectTier() RenderTier {
-    if (std.posix.getenv("DISPLAY") != null) return .cpu;
-    if (std.posix.getenv("WAYLAND_DISPLAY") != null) return .cpu;
+    if (std.c.getenv("DISPLAY") != null) return .cpu;
+    if (std.c.getenv("WAYLAND_DISPLAY") != null) return .cpu;
     return .tty;
 }
 

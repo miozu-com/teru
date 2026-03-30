@@ -66,7 +66,9 @@ pub fn fire(self: *const Hooks, hook: HookEvent) void {
         .session_save => self.on_session_save,
     } orelse return;
 
-    const pid = posix.fork() catch return;
+    const rc = std.os.linux.fork();
+    const pid: isize = @bitCast(rc);
+    if (pid < 0) return; // fork failed
     if (pid == 0) {
         // Child process: exec /bin/sh -c "<command>"
         const argv = [_:null]?[*:0]const u8{
@@ -75,9 +77,9 @@ pub fn fire(self: *const Hooks, hook: HookEvent) void {
             cmd,
         };
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        posix.execveZ("/bin/sh", &argv, envp) catch {};
+        _ = posix.system.execve("/bin/sh", &argv, @ptrCast(envp));
         // execve only returns on error — exit the child
-        posix.exit(1);
+        std.os.linux.exit(1);
     }
     // Parent: fire-and-forget — don't waitpid.
     // SIGCHLD with SA_NOCLDWAIT or ignoring prevents zombies.
@@ -167,5 +169,6 @@ test "fire executes command asynchronously" {
 
     // Brief wait for the child to execute (fire-and-forget, so we just
     // verify no crash/hang). In practice the child is already done.
-    std.Thread.sleep(10_000_000); // 10ms
+    const req = std.os.linux.timespec{ .sec = 0, .nsec = 10_000_000 }; // 10ms
+    _ = std.os.linux.nanosleep(&req, null);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const linux = std.os.linux;
 const Pty = @import("pty/Pty.zig");
 const Grid = @import("core/Grid.zig");
 const VtParser = @import("core/VtParser.zig");
@@ -21,10 +22,12 @@ const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
 else
     void;
 
+const compat = @import("compat.zig");
+
 const version = "0.1.0";
 
 fn out(msg: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, msg) catch {};
+    _ = std.c.write(posix.STDOUT_FILENO, msg.ptr, msg.len);
 }
 
 fn outFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
@@ -32,30 +35,33 @@ fn outFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
     out(msg);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init.Minimal) !void {
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = debug_alloc.allocator();
+    defer _ = debug_alloc.deinit();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Parse command line args (0.16: std.process.Args.Iterator replaces argsAlloc)
+    var args_iter = std.process.Args.Iterator.init(init.args);
+    _ = args_iter.next(); // skip argv[0]
+    const first_arg: ?[:0]const u8 = args_iter.next();
 
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--version")) {
-        var buf: [64]u8 = undefined;
-        outFmt(&buf, "teru {s}\n", .{version});
-        return;
-    }
-
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
-        out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\n");
-        return;
+    if (first_arg) |arg| {
+        if (std.mem.eql(u8, arg, "--version")) {
+            var buf: [64]u8 = undefined;
+            outFmt(&buf, "teru {s}\n", .{version});
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--help")) {
+            out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\n");
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--raw")) {
+            return runRawMode(allocator);
+        }
     }
 
     // Detect rendering tier
     const tier = render.detectTier();
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--raw")) {
-        return runRawMode(allocator);
-    }
     if (tier == .tty) {
         return runRawMode(allocator); // No display server, fall back to TTY
     }
@@ -72,12 +78,12 @@ const PrefixState = struct {
 
     fn activate(self: *PrefixState) void {
         self.awaiting = true;
-        self.timestamp_ns = std.time.nanoTimestamp();
+        self.timestamp_ns = compat.nanoTimestamp();
     }
 
     fn isExpired(self: *const PrefixState) bool {
         if (!self.awaiting) return false;
-        const elapsed = std.time.nanoTimestamp() - self.timestamp_ns;
+        const elapsed = compat.nanoTimestamp() - self.timestamp_ns;
         return elapsed > TIMEOUT_NS;
     }
 
@@ -336,7 +342,9 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                 pane.grid.dirty = false;
             }
         } else {
-            std.Thread.sleep(1_000_000); // 1ms idle
+            // 1ms idle sleep via linux nanosleep (Thread.sleep removed in 0.16)
+            const req = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&req, null);
         }
     }
 }
@@ -412,21 +420,24 @@ fn handleMuxCommand(
 /// Copy text to the system clipboard via xclip (fork + exec).
 fn copyToClipboard(text: []const u8) void {
     // Create a pipe so we can write text to xclip's stdin
-    const pipe_fds = posix.pipe2(.{}) catch return;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
     const read_end = pipe_fds[0];
     const write_end = pipe_fds[1];
 
-    const pid = posix.fork() catch {
-        posix.close(read_end);
-        posix.close(write_end);
+    const fork_rc = linux.fork();
+    const pid: isize = @bitCast(fork_rc);
+    if (pid < 0) {
+        _ = posix.system.close(read_end);
+        _ = posix.system.close(write_end);
         return;
-    };
+    }
 
     if (pid == 0) {
         // Child: redirect stdin to read end of pipe
-        posix.close(write_end);
-        posix.dup2(read_end, posix.STDIN_FILENO) catch posix.exit(1);
-        posix.close(read_end);
+        _ = posix.system.close(write_end);
+        _ = std.c.dup2(read_end, posix.STDIN_FILENO);
+        _ = posix.system.close(read_end);
 
         const argv = [_:null]?[*:0]const u8{
             "xclip",
@@ -434,37 +445,40 @@ fn copyToClipboard(text: []const u8) void {
             "clipboard",
         };
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        posix.execveZ("/usr/bin/xclip", &argv, envp) catch {};
+        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
         // If xclip not at /usr/bin, try PATH
-        posix.execvpeZ("xclip", &argv, envp) catch {};
-        posix.exit(1);
+        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
+        linux.exit(1);
     }
 
     // Parent: write text to pipe, then close
-    posix.close(read_end);
-    _ = posix.write(write_end, text) catch {};
-    posix.close(write_end);
+    _ = posix.system.close(read_end);
+    _ = std.c.write(write_end, text.ptr, text.len);
+    _ = posix.system.close(write_end);
     // Fire-and-forget — don't waitpid (SIGCHLD ignored)
 }
 
 /// Paste from the system clipboard via xclip, writing output to the PTY.
 fn pasteFromClipboard(pty: *const Pty) void {
     // Create a pipe so we can read xclip's stdout
-    const pipe_fds = posix.pipe2(.{}) catch return;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
     const read_end = pipe_fds[0];
     const write_end = pipe_fds[1];
 
-    const pid = posix.fork() catch {
-        posix.close(read_end);
-        posix.close(write_end);
+    const fork_rc = linux.fork();
+    const pid: isize = @bitCast(fork_rc);
+    if (pid < 0) {
+        _ = posix.system.close(read_end);
+        _ = posix.system.close(write_end);
         return;
-    };
+    }
 
     if (pid == 0) {
         // Child: redirect stdout to write end of pipe
-        posix.close(read_end);
-        posix.dup2(write_end, posix.STDOUT_FILENO) catch posix.exit(1);
-        posix.close(write_end);
+        _ = posix.system.close(read_end);
+        _ = std.c.dup2(write_end, posix.STDOUT_FILENO);
+        _ = posix.system.close(write_end);
 
         const argv = [_:null]?[*:0]const u8{
             "xclip",
@@ -473,13 +487,12 @@ fn pasteFromClipboard(pty: *const Pty) void {
             "-o",
         };
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        posix.execveZ("/usr/bin/xclip", &argv, envp) catch {};
-        posix.execvpeZ("xclip", &argv, envp) catch {};
-        posix.exit(1);
+        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
+        linux.exit(1);
     }
 
     // Parent: read from pipe and write to PTY
-    posix.close(write_end);
+    _ = posix.system.close(write_end);
 
     var buf: [8192]u8 = undefined;
     while (true) {
@@ -487,10 +500,11 @@ fn pasteFromClipboard(pty: *const Pty) void {
         if (n == 0) break;
         _ = pty.write(buf[0..n]) catch break;
     }
-    posix.close(read_end);
+    _ = posix.system.close(read_end);
 
     // Reap the child
-    _ = posix.waitpid(pid, 0);
+    var status: c_int = 0;
+    _ = std.c.waitpid(@intCast(pid), &status, 0);
 }
 
 fn runRawMode(allocator: std.mem.Allocator) !void {
@@ -505,10 +519,10 @@ fn runRawMode(allocator: std.mem.Allocator) !void {
     var buf: [256]u8 = undefined;
     outFmt(&buf, "\x1b[38;5;208m[teru {s}]\x1b[0m AI-first terminal · {d}x{d}\n", .{ version, size.cols, size.rows });
 
-    var pty = try Pty.spawn(.{ .rows = size.rows, .cols = size.cols });
-    defer pty.deinit();
+    var pty_inst = try Pty.spawn(.{ .rows = size.rows, .cols = size.cols });
+    defer pty_inst.deinit();
 
-    const node_id = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pty.child_pid });
+    const node_id = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pty_inst.child_pid });
 
     const sa = posix.Sigaction{
         .handler = .{ .handler = handleSigwinch },
@@ -516,16 +530,16 @@ fn runRawMode(allocator: std.mem.Allocator) !void {
         .flags = 0x10000000,
     };
     posix.sigaction(posix.SIG.WINCH, &sa, null);
-    g_pty_master_fd = pty.master;
+    g_pty_master_fd = pty_inst.master;
     g_host_fd = terminal.host_fd;
 
     try terminal.enterRawMode();
     out("\x1b[2J\x1b[H");
-    terminal.runLoop(&pty) catch {};
+    terminal.runLoop(&pty_inst) catch {};
     terminal.exitRawMode();
 
-    if (pty.child_pid != null) {
-        const status = pty.waitForExit() catch 0;
+    if (pty_inst.child_pid != null) {
+        const status = pty_inst.waitForExit() catch 0;
         graph.markFinished(node_id, @truncate(status >> 8));
     }
     outFmt(&buf, "\n\x1b[38;5;208m[teru]\x1b[0m session ended · {d} node(s)\n", .{graph.nodeCount()});
@@ -534,7 +548,7 @@ fn runRawMode(allocator: std.mem.Allocator) !void {
 var g_pty_master_fd: posix.fd_t = -1;
 var g_host_fd: posix.fd_t = posix.STDIN_FILENO;
 
-fn handleSigwinch(_: c_int) callconv(.c) void {
+fn handleSigwinch(_: posix.SIG) callconv(.c) void {
     if (g_pty_master_fd < 0) return;
     var ws: posix.winsize = undefined;
     if (posix.system.ioctl(g_host_fd, posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) return;
