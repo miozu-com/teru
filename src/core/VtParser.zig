@@ -338,7 +338,9 @@ fn handleEscape(self: *VtParser, byte: u8) void {
 
 fn handleCsiEntry(self: *VtParser, byte: u8) void {
     switch (byte) {
-        '?' => {
+        '?', '>', '=', '<' => {
+            // CSI private markers: ? (DEC private), > (Secondary DA),
+            // = (tertiary DA), < (DECRQM). All route to private dispatch.
             self.private_marker = true;
             self.state = .csi_param;
         },
@@ -627,8 +629,9 @@ fn dispatchCsiPrivate(self: *VtParser, final: u8) void {
             }
         },
         'c' => {
-            // DA1 — Primary Device Attributes
-            // Respond: "I'm a VT220 with ANSI color" (what xterm reports)
+            // DA1 (ESC[?c) — Primary Device Attributes
+            // DA2 (ESC[>c) — Secondary Device Attributes
+            // Both respond with VT220-compatible identifiers
             self.sendResponse("\x1b[?62;22c");
         },
         'n' => {
