@@ -13,7 +13,17 @@ const xkb_keysym_t = u32;
 
 extern "xkbcommon" fn xkb_context_new(flags: u32) callconv(.c) ?*xkb_context;
 extern "xkbcommon" fn xkb_context_unref(ctx: *xkb_context) callconv(.c) void;
-extern "xkbcommon" fn xkb_keymap_new_from_names(ctx: *xkb_context, names: ?*const anyopaque, flags: u32) callconv(.c) ?*xkb_keymap;
+extern "xkbcommon" fn xkb_keymap_new_from_names(ctx: *xkb_context, names: ?*const XkbRuleNames, flags: u32) callconv(.c) ?*xkb_keymap;
+
+/// RMLVO rule names for xkb_keymap_new_from_names.
+/// Mirrors struct xkb_rule_names from xkbcommon.h.
+const XkbRuleNames = extern struct {
+    rules: ?[*:0]const u8 = null,
+    model: ?[*:0]const u8 = null,
+    layout: ?[*:0]const u8 = null,
+    variant: ?[*:0]const u8 = null,
+    options: ?[*:0]const u8 = null,
+};
 extern "xkbcommon" fn xkb_keymap_unref(keymap: *xkb_keymap) callconv(.c) void;
 extern "xkbcommon" fn xkb_state_new(keymap: *xkb_keymap) callconv(.c) ?*xkb_state;
 extern "xkbcommon" fn xkb_state_unref(state: *xkb_state) callconv(.c) void;
@@ -64,7 +74,22 @@ pub const Keyboard = struct {
         const ctx = xkb_context_new(0) orelse return error.XkbContextFailed;
         errdefer xkb_context_unref(ctx);
 
-        const keymap = xkb_keymap_new_from_names(ctx, null, 0) orelse {
+        // Query the active X11 keyboard layout via XKB_DEFAULT_* env vars
+        // (set by setxkbmap) or fall back to system defaults.
+        // xkbcommon checks these env vars when the field is null:
+        //   XKB_DEFAULT_RULES, XKB_DEFAULT_MODEL, XKB_DEFAULT_LAYOUT,
+        //   XKB_DEFAULT_VARIANT, XKB_DEFAULT_OPTIONS
+        // Passing null for all fields lets xkbcommon pick them up.
+        // If env vars aren't set, we explicitly try common X11 config.
+        const compat = @import("../../compat.zig");
+        const names = XkbRuleNames{
+            .rules = null, // xkbcommon checks XKB_DEFAULT_RULES
+            .model = null, // xkbcommon checks XKB_DEFAULT_MODEL
+            .layout = if (compat.getenv("XKB_DEFAULT_LAYOUT")) |l| @ptrCast(l.ptr) else null,
+            .variant = if (compat.getenv("XKB_DEFAULT_VARIANT")) |v| @ptrCast(v.ptr) else null,
+            .options = if (compat.getenv("XKB_DEFAULT_OPTIONS")) |o| @ptrCast(o.ptr) else null,
+        };
+        const keymap = xkb_keymap_new_from_names(ctx, &names, 0) orelse {
             return error.XkbKeymapFailed;
         };
         errdefer xkb_keymap_unref(keymap);
