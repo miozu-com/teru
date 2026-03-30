@@ -46,6 +46,11 @@ osc_len: u16 = 0,
 title: [MAX_OSC_LEN]u8 = [_]u8{0} ** MAX_OSC_LEN,
 title_len: u16 = 0,
 
+/// UTF-8 decoder state
+utf8_buf: [4]u8 = undefined,
+utf8_len: u8 = 0,
+utf8_expected: u8 = 0,
+
 /// Cursor visibility
 cursor_visible: bool = true,
 
@@ -86,21 +91,26 @@ pub fn feed(self: *VtParser, data: []const u8) void {
     }
 }
 
-/// SIMD-accelerated scan for special bytes (control chars) in the input buffer.
-/// Returns the index of the first byte < 0x20 (ESC, CR, LF, BS, TAB, BEL, etc.),
-/// or input.len if the entire buffer is printable (0x20..0xFF).
+/// SIMD-accelerated scan for special bytes in the input buffer.
+/// Returns the index of the first byte that needs special handling:
+///   - byte < 0x20 (ESC, CR, LF, BS, TAB, BEL, etc.)
+///   - byte >= 0x80 (UTF-8 multi-byte sequences)
+/// or input.len if the entire buffer is printable ASCII (0x20..0x7F).
 fn findNextSpecial(input: []const u8) usize {
     const Vec16 = @Vector(16, u8);
-    const threshold: Vec16 = @splat(0x20);
+    const lo: Vec16 = @splat(0x20);
+    const hi: Vec16 = @splat(0x80);
 
     var i: usize = 0;
 
     // SIMD path: 16 bytes at a time
     while (i + 16 <= input.len) : (i += 16) {
         const chunk: Vec16 = input[i..][0..16].*;
-        // Any byte < 0x20 is a control character that needs special handling
-        const cmp = chunk < threshold;
-        const mask: u16 = @bitCast(cmp);
+        // Byte < 0x20 (control) OR byte >= 0x80 (UTF-8 lead/continuation)
+        const below = chunk < lo;
+        const above = chunk >= hi;
+        const combined = below | above;
+        const mask: u16 = @bitCast(combined);
         if (mask != 0) {
             return i + @ctz(mask);
         }
@@ -108,7 +118,7 @@ fn findNextSpecial(input: []const u8) usize {
 
     // Scalar fallback for remaining bytes
     while (i < input.len) : (i += 1) {
-        if (input[i] < 0x20) return i;
+        if (input[i] < 0x20 or input[i] > 0x7F) return i;
     }
 
     return input.len;
@@ -172,10 +182,61 @@ fn handleGround(self: *VtParser, byte: u8) void {
             // Other C0 controls: ignore
         },
         else => {
-            // Printable character (or high byte — treat as Latin-1 for now)
-            self.grid.write(@as(u21, byte));
+            // Printable character or UTF-8 byte
+            if (byte >= 0x80) {
+                self.handleUtf8(byte);
+            } else {
+                self.grid.write(@as(u21, byte));
+            }
         },
     }
+}
+
+// ── UTF-8 decoder ───────────────────────────────────────────────
+
+fn handleUtf8(self: *VtParser, byte: u8) void {
+    if (byte & 0xE0 == 0xC0) {
+        // 2-byte sequence start (110xxxxx)
+        self.utf8_buf[0] = byte;
+        self.utf8_len = 1;
+        self.utf8_expected = 2;
+    } else if (byte & 0xF0 == 0xE0) {
+        // 3-byte sequence start (1110xxxx)
+        self.utf8_buf[0] = byte;
+        self.utf8_len = 1;
+        self.utf8_expected = 3;
+    } else if (byte & 0xF8 == 0xF0) {
+        // 4-byte sequence start (11110xxx)
+        self.utf8_buf[0] = byte;
+        self.utf8_len = 1;
+        self.utf8_expected = 4;
+    } else if (byte & 0xC0 == 0x80 and self.utf8_len > 0) {
+        // Continuation byte (10xxxxxx)
+        self.utf8_buf[self.utf8_len] = byte;
+        self.utf8_len += 1;
+
+        if (self.utf8_len == self.utf8_expected) {
+            // Decode complete sequence
+            const cp = decodeUtf8(self.utf8_buf[0..self.utf8_len]);
+            self.utf8_len = 0;
+            self.utf8_expected = 0;
+            self.grid.write(cp);
+        }
+    } else {
+        // Invalid byte — reset decoder, emit replacement character
+        self.utf8_len = 0;
+        self.utf8_expected = 0;
+        self.grid.write(0xFFFD);
+    }
+}
+
+fn decodeUtf8(bytes: []const u8) u21 {
+    return switch (bytes.len) {
+        2 => (@as(u21, bytes[0] & 0x1F) << 6) | @as(u21, bytes[1] & 0x3F),
+        3 => (@as(u21, bytes[0] & 0x0F) << 12) | (@as(u21, bytes[1] & 0x3F) << 6) | @as(u21, bytes[2] & 0x3F),
+        4 => (@as(u21, bytes[0] & 0x07) << 18) | (@as(u21, bytes[1] & 0x3F) << 12) | (@as(u21, bytes[2] & 0x3F) << 6) | @as(u21, bytes[3] & 0x3F),
+        else => 0xFFFD, // replacement character
+    };
 }
 
 // ── Escape state (saw ESC) ───────────────────────────────────────
@@ -1118,4 +1179,84 @@ test "OSC 9999 interleaved with text" {
     // Agent event should be captured
     const payload = parser.consumeAgentEvent() orelse return error.ExpectedAgentEvent;
     try std.testing.expectEqualStrings("agent:task;task=Building", payload);
+}
+
+// ── UTF-8 decoding tests ────────────────────────────────────────
+
+test "UTF-8 2-byte sequence (é = U+00E9)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // é = 0xC3 0xA9
+    parser.feed(&[_]u8{ 0xC3, 0xA9 });
+    try std.testing.expectEqual(@as(u21, 0x00E9), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u16, 1), grid.cursor_col);
+}
+
+test "UTF-8 3-byte sequence (→ = U+2192)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // → = 0xE2 0x86 0x92
+    parser.feed(&[_]u8{ 0xE2, 0x86, 0x92 });
+    try std.testing.expectEqual(@as(u21, 0x2192), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u16, 1), grid.cursor_col);
+}
+
+test "UTF-8 4-byte sequence (U+1F600 grinning face)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // U+1F600 = 0xF0 0x9F 0x98 0x80
+    parser.feed(&[_]u8{ 0xF0, 0x9F, 0x98, 0x80 });
+    try std.testing.expectEqual(@as(u21, 0x1F600), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u16, 1), grid.cursor_col);
+}
+
+test "UTF-8 mixed ASCII and multi-byte" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // "Héllo" — H (ASCII), é (2-byte), l, l, o (ASCII)
+    parser.feed("H\xC3\xA9llo");
+    try std.testing.expectEqual(@as(u21, 'H'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 0x00E9), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'o'), grid.cellAtConst(0, 4).char);
+    try std.testing.expectEqual(@as(u16, 5), grid.cursor_col);
+}
+
+test "UTF-8 decodeUtf8 standalone" {
+    // 2-byte: é (U+00E9)
+    try std.testing.expectEqual(@as(u21, 0x00E9), decodeUtf8(&[_]u8{ 0xC3, 0xA9 }));
+    // 3-byte: → (U+2192)
+    try std.testing.expectEqual(@as(u21, 0x2192), decodeUtf8(&[_]u8{ 0xE2, 0x86, 0x92 }));
+    // 4-byte: U+1F600
+    try std.testing.expectEqual(@as(u21, 0x1F600), decodeUtf8(&[_]u8{ 0xF0, 0x9F, 0x98, 0x80 }));
+    // Invalid length returns replacement char
+    try std.testing.expectEqual(@as(u21, 0xFFFD), decodeUtf8(&[_]u8{0xFF}));
+}
+
+test "SIMD findNextSpecial stops at high bytes" {
+    // Byte 0x80 at position 3 — SIMD must stop there
+    try std.testing.expectEqual(@as(usize, 3), findNextSpecial("ABC\x80"));
+    // All ASCII printable — no stop
+    try std.testing.expectEqual(@as(usize, 5), findNextSpecial("Hello"));
+    // 0xC3 at position 0
+    try std.testing.expectEqual(@as(usize, 0), findNextSpecial("\xC3\xA9"));
+    // Mixed: 5 ASCII then UTF-8 lead byte
+    try std.testing.expectEqual(@as(usize, 5), findNextSpecial("Hello\xC3\xA9"));
+    // 0x7F is below 0x80 — treated as printable by SIMD fast-path
+    try std.testing.expectEqual(@as(usize, 3), findNextSpecial("AB\x7F"));
+    // 0x80 at position 2 — should stop (UTF-8 continuation byte territory)
+    try std.testing.expectEqual(@as(usize, 2), findNextSpecial("AB\x80"));
 }
