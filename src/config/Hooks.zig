@@ -157,8 +157,10 @@ test "fire executes command asynchronously" {
     hooks.setHook(.spawn, "true");
     hooks.fire(.spawn);
 
-    // Brief wait for the child to execute (fire-and-forget, so we just
-    // verify no crash/hang). In practice the child is already done.
+    // Brief wait for the forked child to run. Cannot use io.sleep() here
+    // because the fire() call forks a child process — the parent's io
+    // handle is not valid across fork boundaries. nanosleep is correct
+    // for this test-only wait.
     const req = std.os.linux.timespec{ .sec = 0, .nsec = 10_000_000 }; // 10ms
     _ = std.os.linux.nanosleep(&req, null);
 }

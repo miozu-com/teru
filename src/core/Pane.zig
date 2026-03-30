@@ -21,10 +21,11 @@ pub fn init(allocator: Allocator, rows: u16, cols: u16, id: u64) !Pane {
     var pty = try Pty.spawn(.{ .rows = rows, .cols = cols });
     errdefer pty.deinit();
 
-    // Set PTY to non-blocking via C fcntl (posix.fcntl removed in 0.16)
+    // Set PTY master to non-blocking for event-loop polling
     const flags = std.c.fcntl(pty.master, posix.F.GETFL);
     if (flags < 0) return error.FcntlFailed;
-    _ = std.c.fcntl(pty.master, posix.F.SETFL, flags | 0x800);
+    const O_NONBLOCK = 0x800; // linux/fcntl.h
+    _ = std.c.fcntl(pty.master, posix.F.SETFL, flags | O_NONBLOCK);
 
     return .{
         .pty = pty,

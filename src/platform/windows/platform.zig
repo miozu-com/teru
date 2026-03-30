@@ -1,7 +1,7 @@
 //! Windows platform backend using Win32 API.
 //!
-//! Hand-declared Win32 types and extern functions for cross-compilation
-//! sanity — no @cImport("windows.h"). Creates a window via
+//! Hand-declared Win32 types and extern functions (avoids windows.h
+//! dependency for cross-compilation sanity). Creates a window via
 //! RegisterClassExW + CreateWindowExW, blits CPU framebuffer via
 //! StretchDIBits, polls events via PeekMessageW.
 

@@ -17,9 +17,14 @@ const Grid = @import("../core/Grid.zig");
 
 const McpServer = @This();
 
+// TODO: Migrate to std.Io.net.UnixAddress.listen() once the Io.net API supports
+// non-blocking accept (needed for single-threaded event loop integration).
+// As of 0.16-dev.3039, Server.accept() either blocks or returns WouldBlock with
+// no public API to set the socket to non-blocking mode.
+
 const max_request: usize = 65536;
 const max_response: usize = 65536;
-const socket_path_max: usize = 108; // sun_path size
+const socket_path_max: usize = 108; // Unix domain socket sun_path limit
 
 socket_path: [socket_path_max]u8,
 socket_path_len: usize,
@@ -51,10 +56,11 @@ pub fn init(allocator: Allocator, mux: *Multiplexer, graph: *ProcessGraph) !McpS
     if (sock < 0) return error.SocketFailed;
     errdefer _ = posix.system.close(sock);
 
-    // Set non-blocking
+    // Set non-blocking for event-loop polling (accept returns EAGAIN when idle)
     const flags = std.c.fcntl(sock, posix.F.GETFL);
     if (flags < 0) return error.FcntlFailed;
-    _ = std.c.fcntl(sock, posix.F.SETFL, flags | 0x800); // O_NONBLOCK
+    const O_NONBLOCK = 0x800; // linux/fcntl.h
+    _ = std.c.fcntl(sock, posix.F.SETFL, flags | O_NONBLOCK);
 
     // Bind to path
     var addr: posix.sockaddr.un = std.mem.zeroes(posix.sockaddr.un);
@@ -65,8 +71,7 @@ pub fn init(allocator: Allocator, mux: *Multiplexer, graph: *ProcessGraph) !McpS
     if (std.c.bind(sock, addr_ptr, @sizeOf(posix.sockaddr.un)) != 0)
         return error.BindFailed;
 
-    // Allow group read/write (so other processes of the same user can connect)
-    // chmod 0660 on the socket
+    // Allow owner + group read/write so same-user processes can connect
     _ = std.c.chmod(@ptrCast(&unlink_buf), 0o660);
 
     if (std.c.listen(sock, 5) != 0)
@@ -417,7 +422,7 @@ fn toolCreatePane(self: *McpServer, workspace: u8, buf: []u8, id: ?[]const u8) [
     const pane_id = self.multiplexer.spawnPane(24, 80) catch
         return jsonRpcError(buf, id, -32603, "Spawn failed");
 
-    // Register in graph
+    // Register in graph — non-fatal: pane works without graph tracking
     if (self.multiplexer.getPaneById(pane_id)) |pane| {
         _ = self.graph.spawn(.{
             .name = "shell",

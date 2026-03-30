@@ -2,7 +2,7 @@
 //!
 //! Creates a toplevel window via xdg_wm_base, blits CPU framebuffer
 //! via shared-memory buffers (wl_shm). Keyboard events delivered as
-//! raw keycodes (xkbcommon integration planned for later).
+//! raw keycodes; xkbcommon translation handled by keyboard.zig.
 //!
 //! Dependencies: libwayland-client, vendored xdg-shell protocol code.
 
@@ -12,7 +12,7 @@ const platform = @import("platform.zig");
 pub const Event = platform.Event;
 pub const KeyEvent = platform.KeyEvent;
 
-// ── Wayland core types (replaces @cImport of wayland-client.h) ────────
+// ── Wayland core types (extern linkage against libwayland-client) ─────
 
 const wl_proxy = opaque {};
 const wl_display = opaque {};
@@ -514,7 +514,7 @@ pub const WaylandWindow = struct {
             if (new_w != self.width or new_h != self.height) {
                 self.width = new_w;
                 self.height = new_h;
-                // Recreate SHM buffer for new size
+                // Recreate SHM buffer for new size — best-effort: keep old buffer on failure
                 self.destroyShmBuffer();
                 self.createShmBuffer(new_w, new_h) catch {};
                 return .{ .resize = .{ .width = new_w, .height = new_h } };

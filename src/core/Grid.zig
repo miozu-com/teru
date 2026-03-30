@@ -151,6 +151,7 @@ pub fn scrollUpN(self: *Grid, n: u16) void {
             }
             // Trim trailing spaces
             while (len > 0 and line_buf[len - 1] == ' ') len -= 1;
+            // Scrollback capture is best-effort: OOM just drops the line
             sb.pushLine(line_buf[0..len], self) catch {};
         }
 

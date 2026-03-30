@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
-    // Parse command line args (0.16: std.process.Args.Iterator replaces argsAlloc)
+    // Parse command line args
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = args_iter.next(); // skip argv[0]
     const first_arg: ?[:0]const u8 = args_iter.next();
@@ -376,7 +376,10 @@ fn autoAssignAgentWorkspace(mux: *Multiplexer, node_id: u64, group: []const u8) 
 
     // Ensure the pane is in the layout engine's workspace
     const ws_engine = &mux.layout_engine.workspaces[ws];
-    ws_engine.addNode(mux.allocator, node_id) catch {};
+    ws_engine.addNode(mux.allocator, node_id) catch {
+        // Layout tracking failure — agent runs but won't appear in workspace view
+        return;
+    };
 
     // Update the graph node's workspace
     if (mux.graph) |g| {
@@ -420,10 +423,11 @@ fn runRawMode(allocator: std.mem.Allocator, io: std.Io) !void {
 
     const node_id = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pty_inst.child_pid });
 
+    const SA_RESTART = 0x10000000; // linux/signal.h: restart interrupted syscalls
     const sa = posix.Sigaction{
         .handler = .{ .handler = handleSigwinch },
         .mask = posix.sigemptyset(),
-        .flags = 0x10000000,
+        .flags = SA_RESTART,
     };
     posix.sigaction(posix.SIG.WINCH, &sa, null);
     g_pty_master_fd = pty_inst.master;

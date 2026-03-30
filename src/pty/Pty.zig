@@ -20,7 +20,7 @@ pub const SpawnOptions = struct {
 pub fn spawn(opts: SpawnOptions) !Pty {
     const shell = opts.shell orelse getDefaultShell();
 
-    // Open pseudoterminal via openat(AT_FDCWD, ...) — replaces removed posix.open()
+    // Open pseudoterminal master
     const master = try posix.openatZ(posix.AT.FDCWD, "/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
     errdefer _ = posix.system.close(master);
 
@@ -40,7 +40,7 @@ pub fn spawn(opts: SpawnOptions) !Pty {
     };
     _ = posix.system.ioctl(master, posix.T.IOCSWINSZ, @intFromPtr(&ws));
 
-    // Fork — using linux syscall directly (posix.fork removed in 0.16)
+    // Fork child process for the shell
     const fork_rc = linux.fork();
     const fork_pid: isize = @bitCast(fork_rc);
     if (fork_pid < 0) return error.ForkFailed;
@@ -61,13 +61,13 @@ pub fn spawn(opts: SpawnOptions) !Pty {
         _ = posix.system.ioctl(slave, posix.T.IOCSCTTY, @as(usize, 0));
 
         // Redirect stdin/stdout/stderr to slave PTY
-        _ = std.c.dup2(slave, 0);
-        _ = std.c.dup2(slave, 1);
-        _ = std.c.dup2(slave, 2);
-        if (slave > 2) _ = posix.system.close(slave);
+        _ = std.c.dup2(slave, posix.STDIN_FILENO);
+        _ = std.c.dup2(slave, posix.STDOUT_FILENO);
+        _ = std.c.dup2(slave, posix.STDERR_FILENO);
+        if (slave > posix.STDERR_FILENO) _ = posix.system.close(slave);
 
-        // Set window size on the slave side too
-        _ = posix.system.ioctl(0, posix.T.IOCSWINSZ, @intFromPtr(&ws));
+        // Set window size on the slave side (via stdin which now points to the PTY)
+        _ = posix.system.ioctl(posix.STDIN_FILENO, posix.T.IOCSWINSZ, @intFromPtr(&ws));
 
         // Set environment
         setChildEnv(opts.cols, opts.rows);
@@ -143,7 +143,8 @@ pub fn deinit(self: *Pty) void {
 pub fn isAlive(self: *const Pty) bool {
     if (self.child_pid) |pid| {
         var status: c_int = 0;
-        const rc = std.c.waitpid(pid, &status, 1); // WNOHANG = 1
+        const WNOHANG = 1; // sys/wait.h
+        const rc = std.c.waitpid(pid, &status, WNOHANG);
         return rc == 0; // 0 means still running
     }
     return false;

@@ -49,6 +49,7 @@ pub const Renderer = union(enum) {
 
     pub fn resize(self: *Renderer, width: u32, height: u32) void {
         switch (self.*) {
+            // Framebuffer realloc: keep old size on OOM rather than crash
             .cpu => |*cpu| cpu.resize(width, height) catch {},
             .tty => {},
         }

@@ -11,7 +11,7 @@ pub const KeyEvent = platform.KeyEvent;
 pub const MouseButton = platform.MouseButton;
 pub const MouseEvent = platform.MouseEvent;
 
-// ── XCB type declarations (replaces @cImport of xcb/xcb.h) ───────────
+// ── XCB type declarations (extern linkage against libxcb) ─────────────
 
 const xcb_connection_t = opaque {};
 const xcb_window_t = u32;
@@ -274,7 +274,8 @@ pub const X11Window = struct {
     pub fn pollEvents(self: *X11Window) ?Event {
         const raw_event = xcb_poll_for_event(self.connection) orelse return null;
         defer std.c.free(raw_event);
-        const response_type: u8 = raw_event.*.response_type & 0x7f;
+        const XCB_EVENT_RESPONSE_TYPE_MASK: u8 = 0x7f; // strips sent_event flag
+        const response_type: u8 = raw_event.*.response_type & XCB_EVENT_RESPONSE_TYPE_MASK;
 
         return switch (response_type) {
             XCB_EXPOSE => .expose,

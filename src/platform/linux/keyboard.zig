@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-// ── xkbcommon externs (hand-declared, no @cImport) ─────────────────
+// ── xkbcommon externs (extern linkage against libxkbcommon) ─────────
 
 const xkb_context = opaque {};
 const xkb_keymap = opaque {};

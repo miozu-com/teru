@@ -53,6 +53,7 @@ pub fn handleMuxCommand(
             // Spawn new pane
             const id = mux.spawnPane(grid_rows, grid_cols) catch return;
             if (mux.getPaneById(id)) |pane| {
+                // Graph registration failure is non-fatal: pane works without tracking
                 _ = graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid }) catch {};
             }
             hooks.fire(.spawn);
@@ -74,7 +75,9 @@ pub fn handleMuxCommand(
         ' ' => mux.cycleLayout(),
         'd' => {
             // Detach: save session and exit
-            mux.saveSession(graph, "/tmp/teru-session.bin", io) catch {};
+            mux.saveSession(graph, "/tmp/teru-session.bin", io) catch {
+                // Session save failed — still detach (data loss over hang)
+            };
             hooks.fire(.session_save);
             running.* = false;
         },
