@@ -55,14 +55,14 @@ pub const Platform = union(enum) {
     pub fn putFramebuffer(self: *Platform, pixels: []const u32, width: u32, height: u32) void {
         switch (self.*) {
             .x11 => |*w| w.putFramebuffer(pixels, width, height),
-            .wayland_ => {}, // TODO: wl_shm buffer
+            .wayland_ => |*w| w.putFramebuffer(pixels, width, height),
         }
     }
 
     pub fn getSize(self: *const Platform) Size {
         return switch (self.*) {
-            .x11 => |*w| .{ .width = w.width, .height = w.height },
-            .wayland_ => |*w| .{ .width = w.width, .height = w.height },
+            .x11 => |*w| w.getSize(),
+            .wayland_ => |*w| w.getSize(),
         };
     }
 };
