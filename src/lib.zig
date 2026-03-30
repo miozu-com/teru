@@ -21,6 +21,7 @@ pub const Grid = @import("core/Grid.zig");
 pub const VtParser = @import("core/VtParser.zig");
 pub const Session = @import("persist/Session.zig");
 pub const LayoutEngine = @import("tiling/LayoutEngine.zig");
+pub const render = @import("render/render.zig");
 
 test {
     _ = Pty;
@@ -32,4 +33,5 @@ test {
     _ = VtParser;
     _ = Session;
     _ = LayoutEngine;
+    _ = render;
 }

@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ── libteru (core library, C-ABI compatible) ──────────────────────
+    // Tests and library do NOT link GPU/font libs — only pure Zig logic.
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -17,13 +18,28 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // ── teru executable ──────────────────────────────────────────────
+    // ── teru executable (links GPU + font + windowing libs) ──────────
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+
+    // System libraries for the windowed terminal
+    const gpu_libs = [_][]const u8{
+        "GL",         // OpenGL
+        "EGL",        // EGL context creation
+        "xcb",        // X11 via XCB
+        "X11",        // Xlib (for XOpenDisplay, XGetXCBConnection)
+        "X11-xcb",    // Xlib-XCB bridge
+        "freetype2",  // Font rasterization
+        "fontconfig",  // System font discovery
+    };
+    for (gpu_libs) |lib_name| {
+        exe_mod.linkSystemLibrary(lib_name, .{});
+    }
+
     const exe = b.addExecutable(.{
         .name = "teru",
         .root_module = exe_mod,
@@ -39,7 +55,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run teru terminal");
     run_step.dependOn(&run_cmd.step);
 
-    // ── tests ────────────────────────────────────────────────────────
+    // ── tests (pure Zig, no GPU libs needed) ─────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
