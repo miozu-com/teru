@@ -67,15 +67,17 @@ agent_event_buf: [512]u8 = undefined,
 agent_event_len: usize = 0,
 has_agent_event: bool = false,
 
+/// Whether DA1/DSR responses are enabled. Disabled during startup to prevent
+/// echo-back (shell re-enables ECHO on init). Enabled after event loop starts.
+responses_enabled: bool = false,
+
 pub fn init(grid: *Grid) VtParser {
     return .{ .grid = grid };
 }
 
 /// Send a response back to the PTY (for DA1, DSR, etc.)
-/// Writes to the PTY master fd — the shell reads this from stdin.
-/// PTY slave ECHO must be off (set in Pty.spawn) to prevent echo-back.
 fn sendResponse(self: *const VtParser, data: []const u8) void {
-    if (self.response_fd >= 0) {
+    if (self.responses_enabled and self.response_fd >= 0) {
         _ = std.c.write(self.response_fd, data.ptr, data.len);
     }
 }

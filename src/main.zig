@@ -142,9 +142,18 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Initial PTY read — process first batch of shell output
+    // Initial PTY read — process first batch of shell output.
+    // Responses are disabled during startup to prevent echo-back
+    // (shell re-enables ECHO on init, causing our DA1 response
+    // to be echoed as typed text).
     if (mux.getActivePane()) |pane| {
         _ = pane.readAndProcess(&pty_buf) catch {};
+    }
+
+    // Enable VT responses now that the shell has initialized.
+    // From here on, DA1/DSR queries will be answered correctly.
+    for (mux.panes.items) |*pane| {
+        pane.vt.responses_enabled = true;
     }
 
     while (running) {
