@@ -164,40 +164,45 @@ pub fn getGlyph(self: *const FontAtlas, codepoint: u21) ?GlyphInfo {
 // ── Font discovery (no fontconfig) ─────────────────────────────────
 
 const font_search_paths = [_][]const u8{
-    "/usr/share/fonts/TTF",
-    "/usr/share/fonts/truetype",
-    "/usr/share/fonts/truetype/dejavu",
-    "/usr/share/fonts/truetype/liberation",
-    "/usr/share/fonts/truetype/hack",
-    "/usr/share/fonts/nerd-fonts",
-    "/usr/share/fonts/OTF",
-    "/usr/local/share/fonts",
+    "/usr/share/fonts/TTF",           // Arch Linux
+    "/usr/share/fonts/nerd-fonts",    // Arch nerd-fonts
+    "/usr/share/fonts/OTF",           // Arch OTF
+    "/usr/share/fonts/truetype/hack", // Debian/Ubuntu hack
+    "/usr/share/fonts/truetype/dejavu", // Debian/Ubuntu dejavu
+    "/usr/share/fonts/truetype/liberation", // Debian/Ubuntu liberation
+    "/usr/share/fonts/truetype",      // Debian/Ubuntu general
+    "/usr/share/fonts/Adwaita",       // GNOME/Fedora
+    "/usr/local/share/fonts",         // User-installed
 };
 
 const preferred_fonts = [_][]const u8{
     "Hack-Regular.ttf",
     "HackNerdFont-Regular.ttf",
+    "HackNerdFontMono-Regular.ttf",
+    "JetBrainsMono-Regular.ttf",
+    "JetBrainsMonoNerdFont-Regular.ttf",
+    "SourceCodePro-Regular.ttf",
+    "FiraCode-Regular.ttf",
     "DejaVuSansMono.ttf",
     "LiberationMono-Regular.ttf",
-    "SourceCodePro-Regular.ttf",
-    "JetBrainsMono-Regular.ttf",
-    "FiraCode-Regular.ttf",
     "UbuntuMono-Regular.ttf",
     "Inconsolata-Regular.ttf",
     "RobotoMono-Regular.ttf",
+    "AdwaitaMono-Regular.ttf",
     "DroidSansMono.ttf",
 };
 
 fn findMonospaceFont(allocator: std.mem.Allocator, io: Io) ![]const u8 {
-    // Try preferred fonts in standard paths
+    _ = io; // Font discovery uses fast libc access() — no Io overhead
+
+    // Try preferred fonts in standard paths (fast: raw access syscall)
     for (font_search_paths) |dir| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, font_name });
-            if (Dir.cwd().access(io, path, .{ .read = true })) |_| {
+            if (accessFast(path)) {
                 return path;
-            } else |_| {
-                allocator.free(path);
             }
+            allocator.free(path);
         }
     }
 
@@ -205,15 +210,24 @@ fn findMonospaceFont(allocator: std.mem.Allocator, io: Io) ![]const u8 {
     if (compat.getenv("HOME")) |home| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/.local/share/fonts/{s}", .{ home, font_name });
-            if (Dir.cwd().access(io, path, .{ .read = true })) |_| {
+            if (accessFast(path)) {
                 return path;
-            } else |_| {
-                allocator.free(path);
             }
+            allocator.free(path);
         }
     }
 
     return error.NoMonospaceFontFound;
+}
+
+/// Fast file existence check via libc access() — avoids Io vtable overhead.
+fn accessFast(path: []const u8) bool {
+    // Need null-terminated path for C access()
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return std.c.access(&buf, 0) == 0; // F_OK = 0
 }
 
 fn loadFile(allocator: std.mem.Allocator, path: []const u8, io: Io) ![]u8 {

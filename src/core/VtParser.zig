@@ -22,6 +22,7 @@ pub const State = enum {
     csi_param, // collecting params
     csi_intermediate, // saw intermediate byte (0x20-0x2F)
     osc_string, // saw ESC], collecting until BEL/ST
+    dcs_passthrough, // saw ESC P, ignore until ST (ESC \)
 };
 
 pub const MAX_PARAMS = 16;
@@ -173,6 +174,17 @@ fn processByte(self: *VtParser, byte: u8) void {
         .csi_param => self.handleCsiParam(byte),
         .csi_intermediate => self.handleCsiIntermediate(byte),
         .osc_string => self.handleOscString(byte),
+        .dcs_passthrough => {
+            // DCS: silently consume until ST (ESC \) or BEL
+            if (byte == 0x1B) {
+                // Could be ESC \ (ST) — peek at escape handler
+                self.state = .escape;
+            } else if (byte == 0x07) {
+                // BEL also terminates DCS
+                self.state = .ground;
+            }
+            // All other bytes: silently consumed (no output)
+        },
     }
 }
 
@@ -309,6 +321,11 @@ fn handleEscape(self: *VtParser, byte: u8) void {
             self.grid.scroll_bottom = self.grid.rows -| 1;
             self.cursor_visible = true;
             self.state = .ground;
+        },
+        'P' => {
+            // DCS — Device Control String (XTGETTCAP, DECRQSS, etc.)
+            // Silently consume until ST (ESC \) or BEL
+            self.state = .dcs_passthrough;
         },
         else => {
             // Unknown escape sequence: drop back to ground

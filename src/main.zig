@@ -146,6 +146,11 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
         while (win.pollEvents()) |event| {
             switch (event) {
                 .close => running = false,
+                .expose => {
+                    // Window exposed (uncovered, mapped, scratchpad toggle)
+                    // Force full redraw to prevent black fragments
+                    for (mux.panes.items) |*pane| pane.grid.dirty = true;
+                },
                 .resize => |sz| {
                     // Resize renderer
                     renderer.resize(sz.width, sz.height);
