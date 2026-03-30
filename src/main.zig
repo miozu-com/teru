@@ -9,6 +9,7 @@ const Terminal = @import("core/Terminal.zig");
 const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
 const protocol = @import("agent/protocol.zig");
+const McpServer = @import("agent/McpServer.zig");
 const build_options = @import("build_options");
 const Config = @import("config/Config.zig");
 const Hooks = @import("config/Hooks.zig");
@@ -93,14 +94,19 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     const grid_cols: u16 = @intCast(config.initial_width / atlas.cell_width);
     const grid_rows: u16 = @intCast(config.initial_height / atlas.cell_height);
 
-    // Multiplexer: manages all panes
+    // Multiplexer: manages all panes (linked to process graph for agent rendering)
     var mux = Multiplexer.init(allocator);
     defer mux.deinit();
+    mux.graph = &graph;
 
     // Plugin hooks: external commands fired on terminal events
     var hooks = Hooks.init(allocator);
     defer hooks.deinit();
     loadHooks(&config, &hooks);
+
+    // MCP server: exposes pane/graph state to Claude Code over Unix socket
+    var mcp = McpServer.init(allocator, &mux, &graph) catch null;
+    defer if (mcp) |*m| m.deinit();
 
     // Spawn initial pane
     const initial_id = try mux.spawnPane(grid_rows, grid_cols);
@@ -268,20 +274,50 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
         // Poll all PTYs
         const had_output = mux.pollPtys(&pty_buf);
 
+        // Poll MCP server for incoming connections
+        if (mcp) |*m| m.poll();
+
         // Check for agent protocol events on all panes
         for (mux.panes.items) |*pane| {
             if (pane.vt.consumeAgentEvent()) |payload| {
                 if (protocol.parsePayload(payload)) |event_data| {
                     switch (event_data.command) {
                         .start => {
-                            _ = graph.spawn(.{
+                            const node_id = graph.spawn(.{
                                 .name = event_data.name orelse "agent",
                                 .kind = .agent,
                                 .pid = null,
-                            }) catch {};
+                                .agent = .{
+                                    .group = event_data.group orelse "default",
+                                    .role = event_data.role orelse "worker",
+                                },
+                            }) catch continue;
                             hooks.fire(.agent_start);
+
+                            // Auto-workspace: if group specified, move to/create workspace
+                            if (event_data.group) |group_name| {
+                                autoAssignAgentWorkspace(&mux, node_id, group_name);
+                            }
                         },
-                        else => {},
+                        .stop => {
+                            // Find agent node by name and mark finished
+                            if (event_data.name) |name| {
+                                markAgentFinished(&graph, name, event_data.exit_status);
+                            }
+                        },
+                        .status => {
+                            // Update progress/task on the agent node
+                            if (event_data.name) |name| {
+                                updateAgentStatusByName(&graph, name, event_data.task_desc, event_data.progress);
+                            }
+                        },
+                        .task => {
+                            if (event_data.name) |name| {
+                                updateAgentStatusByName(&graph, name, event_data.task_desc, null);
+                            }
+                        },
+                        .group => {}, // handled at start
+                        .meta => {}, // future use
                     }
                 }
             }
@@ -327,6 +363,46 @@ fn loadHooks(config: *const Config, hooks: *Hooks) void {
     if (config.hook_on_close) |cmd| hooks.setHook(.close, cmd);
     if (config.hook_on_agent_start) |cmd| hooks.setHook(.agent_start, cmd);
     if (config.hook_on_session_save) |cmd| hooks.setHook(.session_save, cmd);
+}
+
+// ── Agent lifecycle helpers ────────────────────────────────────
+
+/// Assign an agent node to a workspace matching its group name.
+/// Uses a simple hash of the group name to pick workspace 1-8.
+fn autoAssignAgentWorkspace(mux: *Multiplexer, node_id: u64, group: []const u8) void {
+    // Hash group name to a workspace index (1-8, workspace 0 is the default shell workspace)
+    var hash: u32 = 0;
+    for (group) |c| {
+        hash = hash *% 31 +% c;
+    }
+    const ws: u8 = @truncate((hash % 8) + 1);
+
+    // Ensure the pane is in the layout engine's workspace
+    const ws_engine = &mux.layout_engine.workspaces[ws];
+    ws_engine.addNode(mux.allocator, node_id) catch {};
+
+    // Update the graph node's workspace
+    if (mux.graph) |g| {
+        g.moveToWorkspace(node_id, ws);
+    }
+}
+
+/// Mark an agent as finished by looking it up by name.
+fn markAgentFinished(graph: *ProcessGraph, name: []const u8, exit_status: ?[]const u8) void {
+    const node_id = graph.findAgentByName(name) orelse return;
+    const exit_code: u8 = if (exit_status) |status| blk: {
+        if (std.mem.eql(u8, status, "success") or std.mem.eql(u8, status, "0")) {
+            break :blk 0;
+        }
+        break :blk 1;
+    } else 1;
+    graph.markFinished(node_id, exit_code);
+}
+
+/// Update an agent's task description and progress by name.
+fn updateAgentStatusByName(graph: *ProcessGraph, name: []const u8, task: ?[]const u8, progress: ?f32) void {
+    const node_id = graph.findAgentByName(name) orelse return;
+    graph.updateAgentStatus(node_id, task, progress);
 }
 
 fn runRawMode(allocator: std.mem.Allocator) !void {

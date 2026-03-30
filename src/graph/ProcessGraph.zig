@@ -242,6 +242,39 @@ pub fn agentsInGroup(self: *const ProcessGraph, group: []const u8, buf: []NodeId
     return count;
 }
 
+/// Find an agent node by name. Returns the node ID if found.
+pub fn findAgentByName(self: *const ProcessGraph, name: []const u8) ?NodeId {
+    var it = self.nodes.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .agent and std.mem.eql(u8, entry.value_ptr.name, name)) {
+            return entry.key_ptr.*;
+        }
+    }
+    return null;
+}
+
+/// Count agents by state. Returns counts for running, finished-ok, and failed.
+pub fn countAgentsByState(self: *const ProcessGraph) struct { running: u32, done: u32, failed: u32 } {
+    var running: u32 = 0;
+    var done: u32 = 0;
+    var failed: u32 = 0;
+
+    var it = self.nodes.iterator();
+    while (it.next()) |entry| {
+        const node = entry.value_ptr;
+        if (node.kind == .agent) {
+            switch (node.state) {
+                .running => running += 1,
+                .finished => {
+                    if ((node.exit_code orelse 1) == 0) done += 1 else failed += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    return .{ .running = running, .done = done, .failed = failed };
+}
+
 /// Count total nodes.
 pub fn nodeCount(self: *const ProcessGraph) usize {
     return self.nodes.count();
@@ -322,4 +355,60 @@ test "mark finished" {
     try std.testing.expectEqual(NodeState.finished, node.state);
     try std.testing.expectEqual(@as(u8, 0), node.exit_code.?);
     try std.testing.expect(node.ended_at != null);
+}
+
+test "findAgentByName" {
+    const allocator = std.testing.allocator;
+    var graph = ProcessGraph.init(allocator);
+    defer graph.deinit();
+
+    const agent_id = try graph.spawn(.{
+        .name = "backend-dev",
+        .kind = .agent,
+        .agent = .{ .group = "team-temporal", .role = "implementer" },
+    });
+    _ = try graph.spawn(.{ .name = "shell", .kind = .shell });
+
+    try std.testing.expectEqual(agent_id, graph.findAgentByName("backend-dev").?);
+    try std.testing.expectEqual(@as(?NodeId, null), graph.findAgentByName("nonexistent"));
+    // Shell nodes are not agents — should not be found
+    try std.testing.expectEqual(@as(?NodeId, null), graph.findAgentByName("shell"));
+}
+
+test "countAgentsByState" {
+    const allocator = std.testing.allocator;
+    var graph = ProcessGraph.init(allocator);
+    defer graph.deinit();
+
+    const a1 = try graph.spawn(.{
+        .name = "agent-1",
+        .kind = .agent,
+        .agent = .{ .group = "g", .role = "worker" },
+    });
+    _ = try graph.spawn(.{
+        .name = "agent-2",
+        .kind = .agent,
+        .agent = .{ .group = "g", .role = "worker" },
+    });
+    const a3 = try graph.spawn(.{
+        .name = "agent-3",
+        .kind = .agent,
+        .agent = .{ .group = "g", .role = "worker" },
+    });
+    // Not an agent — should not be counted
+    _ = try graph.spawn(.{ .name = "shell", .kind = .shell });
+
+    // All running
+    var counts = graph.countAgentsByState();
+    try std.testing.expectEqual(@as(u32, 3), counts.running);
+    try std.testing.expectEqual(@as(u32, 0), counts.done);
+    try std.testing.expectEqual(@as(u32, 0), counts.failed);
+
+    // Finish one with success, one with failure
+    graph.markFinished(a1, 0);
+    graph.markFinished(a3, 1);
+    counts = graph.countAgentsByState();
+    try std.testing.expectEqual(@as(u32, 1), counts.running);
+    try std.testing.expectEqual(@as(u32, 1), counts.done);
+    try std.testing.expectEqual(@as(u32, 1), counts.failed);
 }
