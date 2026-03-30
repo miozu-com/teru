@@ -1,7 +1,7 @@
 //! X11 backend using XCB for event handling + EGL for the OpenGL context.
 //!
 //! Creates an X11 window via XCB, sets EWMH properties (_NET_WM_NAME,
-//! WM_CLASS, WM_DELETE_WINDOW), and attaches an EGL OpenGL 4.3 core
+//! WM_CLASS, WM_DELETE_WINDOW), and attaches an EGL OpenGL 4.6 core
 //! context to it.
 
 const std = @import("std");
@@ -179,10 +179,10 @@ pub const X11Window = struct {
             return error.EglChooseConfigFailed;
         }
 
-        // Create OpenGL 4.3 core context
+        // Create OpenGL 4.6 core context (latest, Linux+Windows only — macOS gets Metal)
         const context_attribs = [_]c.EGLint{
             c.EGL_CONTEXT_MAJOR_VERSION, 4,
-            c.EGL_CONTEXT_MINOR_VERSION, 3,
+            c.EGL_CONTEXT_MINOR_VERSION, 6,
             c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
             c.EGL_NONE,
         };
