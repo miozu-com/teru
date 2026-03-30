@@ -4,8 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── libteru (core library, C-ABI compatible) ──────────────────────
-    // Tests and library do NOT link GPU/font libs — only pure Zig logic.
+    // ── libteru (core library, pure Zig, no system deps) ─────────────
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -18,7 +17,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // ── teru executable (links GPU + font + windowing libs) ──────────
+    // ── teru executable ──────────────────────────────────────────────
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -26,17 +25,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // System libraries for the windowed terminal (no GL/EGL — CPU SIMD rendering)
-    const sys_libs = [_][]const u8{
-        "xcb",        // X11 via XCB
-        "X11",        // Xlib (for XOpenDisplay, XGetXCBConnection)
-        "X11-xcb",    // Xlib-XCB bridge
-        "freetype2",  // Font rasterization
-        "fontconfig",  // System font discovery
-    };
-    for (sys_libs) |lib_name| {
-        exe_mod.linkSystemLibrary(lib_name, .{});
-    }
+    // Single system dependency: xcb (X11 protocol)
+    exe_mod.linkSystemLibrary("xcb", .{});
+
+    // Embedded: stb_truetype (compiled from vendored source)
+    exe_mod.addCSourceFile(.{
+        .file = b.path("vendor/stb_truetype.c"),
+        .flags = &.{"-DSTB_TRUETYPE_IMPLEMENTATION"},
+    });
+    exe_mod.addIncludePath(b.path("vendor"));
 
     const exe = b.addExecutable(.{
         .name = "teru",
@@ -53,7 +50,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run teru terminal");
     run_step.dependOn(&run_cmd.step);
 
-    // ── tests (pure Zig, no GPU libs needed) ─────────────────────────
+    // ── tests (pure Zig, no system deps needed) ──────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
