@@ -1,4 +1,4 @@
-//! OpenGL 3.3 core profile renderer for the terminal character grid.
+//! OpenGL 4.3 core profile renderer for the terminal character grid.
 //!
 //! Draws the grid in a single instanced draw call: one quad per cell,
 //! textured from the font atlas, with per-cell foreground/background
