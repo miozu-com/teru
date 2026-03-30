@@ -26,17 +26,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // System libraries for the windowed terminal
-    const gpu_libs = [_][]const u8{
-        "GL",         // OpenGL
-        "EGL",        // EGL context creation
+    // System libraries for the windowed terminal (no GL/EGL — CPU SIMD rendering)
+    const sys_libs = [_][]const u8{
         "xcb",        // X11 via XCB
         "X11",        // Xlib (for XOpenDisplay, XGetXCBConnection)
         "X11-xcb",    // Xlib-XCB bridge
         "freetype2",  // Font rasterization
         "fontconfig",  // System font discovery
     };
-    for (gpu_libs) |lib_name| {
+    for (sys_libs) |lib_name| {
         exe_mod.linkSystemLibrary(lib_name, .{});
     }
 
