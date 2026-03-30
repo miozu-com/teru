@@ -66,6 +66,16 @@ pub fn init(grid: *Grid) VtParser {
     return .{ .grid = grid };
 }
 
+/// Create a VtParser with an undefined grid pointer.
+/// MUST call setGrid() before feeding any data.
+pub fn initEmpty() VtParser {
+    return .{ .grid = undefined };
+}
+
+pub fn setGrid(self: *VtParser, grid: *Grid) void {
+    self.grid = grid;
+}
+
 /// Feed a slice of bytes into the parser.
 /// Uses SIMD fast-path to skip runs of printable ASCII when in ground state.
 pub fn feed(self: *VtParser, data: []const u8) void {

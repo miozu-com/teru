@@ -27,12 +27,22 @@ pub fn init(allocator: Allocator, rows: u16, cols: u16, id: u64) !Pane {
     const O_NONBLOCK = 0x800; // linux/fcntl.h
     _ = std.c.fcntl(pty.master, posix.F.SETFL, flags | O_NONBLOCK);
 
+    // VtParser needs a *Grid pointer. Since Pane will be moved by
+    // ArrayList.append, we set grid to undefined here. Caller MUST
+    // call linkVt() after the Pane is in its final memory location.
     return .{
         .pty = pty,
         .grid = grid,
-        .vt = VtParser.init(&grid),
+        .vt = VtParser.initEmpty(),
         .id = id,
     };
+}
+
+/// Patch the VtParser's grid pointer to this Pane's grid.
+/// MUST be called after the Pane is in its final memory location
+/// (after ArrayList.append or similar move).
+pub fn linkVt(self: *Pane) void {
+    self.vt.grid = &self.grid;
 }
 
 pub fn deinit(self: *Pane, allocator: Allocator) void {
