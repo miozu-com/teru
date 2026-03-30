@@ -103,7 +103,7 @@ pub fn write(self: *Grid, char: u21) void {
 }
 
 /// Move the cursor down one row. If at the scroll region bottom, scroll up.
-fn cursorDown(self: *Grid) void {
+pub fn cursorDown(self: *Grid) void {
     if (self.cursor_row >= self.scroll_bottom) {
         self.scrollUp();
     } else {

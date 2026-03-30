@@ -24,26 +24,50 @@ const Grid = @import("../core/Grid.zig");
 const Vec4u32 = @Vector(4, u32);
 const Vec4u16 = @Vector(4, u16);
 
-// ── Default 16-color palette (SGR indexed colors 0-15) ─────────────
-// Matches opengl.zig's palette exactly, but as packed ARGB u32.
+// ── Full 256-color palette (comptime) ─────────────────────────────────
+// 0-15: standard SGR named colors (matches opengl.zig exactly)
+// 16-231: 6x6x6 color cube
+// 232-255: 24-step grayscale ramp (8, 18, ..., 238)
 
-const default_palette_argb = [16]u32{
-    0xFF000000, // 0  black
-    0xFFCC0000, // 1  red
-    0xFF00CC00, // 2  green
-    0xFFCCCC00, // 3  yellow
-    0xFF0000CC, // 4  blue
-    0xFFCC00CC, // 5  magenta
-    0xFF00CCCC, // 6  cyan
-    0xFFBFBFBF, // 7  white
-    0xFF808080, // 8  bright black
-    0xFFFF0000, // 9  bright red
-    0xFF00FF00, // 10 bright green
-    0xFFFFFF00, // 11 bright yellow
-    0xFF0000FF, // 12 bright blue
-    0xFFFF00FF, // 13 bright magenta
-    0xFF00FFFF, // 14 bright cyan
-    0xFFFFFFFF, // 15 bright white
+const palette_256 = blk: {
+    var table: [256]u32 = undefined;
+
+    // 0-15: standard colors
+    table[0] = 0xFF000000; // black
+    table[1] = 0xFFCC0000; // red
+    table[2] = 0xFF00CC00; // green
+    table[3] = 0xFFCCCC00; // yellow
+    table[4] = 0xFF0000CC; // blue
+    table[5] = 0xFFCC00CC; // magenta
+    table[6] = 0xFF00CCCC; // cyan
+    table[7] = 0xFFBFBFBF; // white
+    table[8] = 0xFF808080; // bright black
+    table[9] = 0xFFFF0000; // bright red
+    table[10] = 0xFF00FF00; // bright green
+    table[11] = 0xFFFFFF00; // bright yellow
+    table[12] = 0xFF0000FF; // bright blue
+    table[13] = 0xFFFF00FF; // bright magenta
+    table[14] = 0xFF00FFFF; // bright cyan
+    table[15] = 0xFFFFFFFF; // bright white
+
+    // 16-231: 6x6x6 color cube
+    for (0..216) |i| {
+        const b_val: u16 = @intCast(i % 6);
+        const g_val: u16 = @intCast((i / 6) % 6);
+        const r_val: u16 = @intCast(i / 36);
+        const r: u32 = if (r_val == 0) 0 else r_val * 40 + 55;
+        const g: u32 = if (g_val == 0) 0 else g_val * 40 + 55;
+        const b: u32 = if (b_val == 0) 0 else b_val * 40 + 55;
+        table[i + 16] = 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    // 232-255: grayscale ramp (8, 18, 28, ..., 238)
+    for (0..24) |i| {
+        const v: u32 = @as(u32, @intCast(i)) * 10 + 8;
+        table[i + 232] = 0xFF000000 | (v << 16) | (v << 8) | v;
+    }
+
+    break :blk table;
 };
 
 // ── SoftwareRenderer ───────────────────────────────────────────────
@@ -319,25 +343,9 @@ fn packArgb(r: u8, g: u8, b: u8) u32 {
         @as(u32, b);
 }
 
-/// Convert a 256-color index to packed ARGB.
+/// Convert a 256-color index to packed ARGB (comptime table lookup).
 fn indexed256Argb(idx: u8) u32 {
-    if (idx < 16) {
-        return default_palette_argb[idx];
-    } else if (idx < 232) {
-        // 6x6x6 color cube (indices 16-231)
-        const ci = idx - 16;
-        const b_val: u16 = ci % 6;
-        const g_val: u16 = (ci / 6) % 6;
-        const r_val: u16 = (ci / 36);
-        const r: u8 = if (r_val == 0) 0 else @intCast(r_val * 40 + 55);
-        const g: u8 = if (g_val == 0) 0 else @intCast(g_val * 40 + 55);
-        const b: u8 = if (b_val == 0) 0 else @intCast(b_val * 40 + 55);
-        return packArgb(r, g, b);
-    } else {
-        // Grayscale ramp (indices 232-255): 8, 18, ..., 238
-        const level: u8 = @intCast(@as(u16, idx - 232) * 10 + 8);
-        return packArgb(level, level, level);
-    }
+    return palette_256[idx];
 }
 
 /// Dim a color by halving R, G, B channels (preserve alpha).

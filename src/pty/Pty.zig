@@ -156,12 +156,12 @@ fn setChildEnv(cols: u16, rows: u16) void {
     _ = setenv("TERM_PROGRAM", "teru", 1);
     _ = setenv("TERM_PROGRAM_VERSION", "0.0.1", 1);
 
-    var cols_buf: [8:0]u8 = undefined;
-    var rows_buf: [8:0]u8 = undefined;
-    const cols_str = std.fmt.bufPrint(&cols_buf, "{d}", .{cols}) catch "80";
-    const rows_str = std.fmt.bufPrint(&rows_buf, "{d}", .{rows}) catch "24";
-    _ = setenv("COLUMNS", @ptrCast(cols_str.ptr), 1);
-    _ = setenv("LINES", @ptrCast(rows_str.ptr), 1);
+    var cols_buf: [8:0]u8 = [_:0]u8{0} ** 8;
+    var rows_buf: [8:0]u8 = [_:0]u8{0} ** 8;
+    _ = std.fmt.bufPrint(&cols_buf, "{d}", .{cols}) catch {};
+    _ = std.fmt.bufPrint(&rows_buf, "{d}", .{rows}) catch {};
+    _ = setenv("COLUMNS", &cols_buf, 1);
+    _ = setenv("LINES", &rows_buf, 1);
 }
 
 // ── C interop for PTY functions ──────────────────────────────────

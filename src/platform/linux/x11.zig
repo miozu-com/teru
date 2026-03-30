@@ -9,76 +9,230 @@ const platform = @import("platform.zig");
 pub const Event = platform.Event;
 pub const KeyEvent = platform.KeyEvent;
 
-const c = @cImport({
-    @cInclude("xcb/xcb.h");
-});
+// ── XCB type declarations (replaces @cImport of xcb/xcb.h) ───────────
+
+const xcb_connection_t = opaque {};
+const xcb_window_t = u32;
+const xcb_atom_t = u32;
+const xcb_gcontext_t = u32;
+const xcb_colormap_t = u32;
+const xcb_visualid_t = u32;
+const xcb_keycode_t = u8;
+const xcb_void_cookie_t = extern struct { sequence: c_uint };
+const xcb_intern_atom_cookie_t = extern struct { sequence: c_uint };
+
+const xcb_screen_t = extern struct {
+    root: xcb_window_t,
+    default_colormap: xcb_colormap_t,
+    white_pixel: u32,
+    black_pixel: u32,
+    current_input_masks: u32,
+    width_in_pixels: u16,
+    height_in_pixels: u16,
+    width_in_millimeters: u16,
+    height_in_millimeters: u16,
+    min_installed_maps: u16,
+    max_installed_maps: u16,
+    root_visual: xcb_visualid_t,
+    backing_stores: u8,
+    save_unders: u8,
+    root_depth: u8,
+    allowed_depths_len: u8,
+};
+
+const xcb_setup_t = opaque {};
+
+const xcb_screen_iterator_t = extern struct {
+    data: ?*xcb_screen_t,
+    rem: c_int,
+    index: c_int,
+};
+
+const xcb_generic_event_t = extern struct {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    pad: [7]u32,
+    full_sequence: u32,
+};
+
+const xcb_configure_notify_event_t = extern struct {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    event: xcb_window_t,
+    window: xcb_window_t,
+    above_sibling: xcb_window_t,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+    override_redirect: u8,
+    pad1: u8,
+};
+
+const xcb_key_press_event_t = extern struct {
+    response_type: u8,
+    detail: xcb_keycode_t,
+    sequence: u16,
+    time: u32,
+    root: xcb_window_t,
+    event: xcb_window_t,
+    child: xcb_window_t,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    state: u16,
+    same_screen: u8,
+    pad0: u8,
+};
+
+const xcb_key_release_event_t = xcb_key_press_event_t;
+
+const xcb_client_message_event_t = extern struct {
+    response_type: u8,
+    format: u8,
+    sequence: u16,
+    window: xcb_window_t,
+    type_: xcb_atom_t,
+    data: extern union {
+        data8: [20]u8,
+        data16: [10]u16,
+        data32: [5]u32,
+    },
+};
+
+const xcb_intern_atom_reply_t = extern struct {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    length: u32,
+    atom: xcb_atom_t,
+};
+
+// ── XCB constants ─────────────────────────────────────────────────────
+
+const XCB_COPY_FROM_PARENT: u8 = 0;
+const XCB_WINDOW_CLASS_INPUT_OUTPUT: u16 = 1;
+
+const XCB_CW_BACK_PIXEL: u32 = 2;
+const XCB_CW_EVENT_MASK: u32 = 2048;
+
+const XCB_EVENT_MASK_EXPOSURE: u32 = 0x8000;
+const XCB_EVENT_MASK_STRUCTURE_NOTIFY: u32 = 0x20000;
+const XCB_EVENT_MASK_KEY_PRESS: u32 = 1;
+const XCB_EVENT_MASK_KEY_RELEASE: u32 = 2;
+const XCB_EVENT_MASK_FOCUS_CHANGE: u32 = 0x200000;
+
+const XCB_PROP_MODE_REPLACE: u8 = 0;
+
+const XCB_EXPOSE: u8 = 12;
+const XCB_CONFIGURE_NOTIFY: u8 = 22;
+const XCB_KEY_PRESS: u8 = 2;
+const XCB_KEY_RELEASE: u8 = 3;
+const XCB_CLIENT_MESSAGE: u8 = 33;
+const XCB_FOCUS_IN: u8 = 9;
+const XCB_FOCUS_OUT: u8 = 10;
+
+const XCB_ATOM_STRING: xcb_atom_t = 31;
+const XCB_ATOM_WM_NAME: xcb_atom_t = 39;
+const XCB_ATOM_WM_CLASS: xcb_atom_t = 67;
+const XCB_ATOM_ATOM: xcb_atom_t = 4;
+const XCB_ATOM_NONE: xcb_atom_t = 0;
+
+const XCB_IMAGE_FORMAT_Z_PIXMAP: u8 = 2;
+
+// ── XCB extern functions ──────────────────────────────────────────────
+
+extern "xcb" fn xcb_connect(display: ?[*:0]const u8, screen: ?*c_int) callconv(.c) ?*xcb_connection_t;
+extern "xcb" fn xcb_disconnect(conn: *xcb_connection_t) callconv(.c) void;
+extern "xcb" fn xcb_connection_has_error(conn: *xcb_connection_t) callconv(.c) c_int;
+extern "xcb" fn xcb_get_setup(conn: *xcb_connection_t) callconv(.c) *const xcb_setup_t;
+extern "xcb" fn xcb_setup_roots_iterator(setup: *const xcb_setup_t) callconv(.c) xcb_screen_iterator_t;
+extern "xcb" fn xcb_screen_next(iter: *xcb_screen_iterator_t) callconv(.c) void;
+extern "xcb" fn xcb_generate_id(conn: *xcb_connection_t) callconv(.c) u32;
+extern "xcb" fn xcb_create_window(conn: *xcb_connection_t, depth: u8, wid: xcb_window_t, parent: xcb_window_t, x: i16, y: i16, width: u16, height: u16, border_width: u16, class: u16, visual: xcb_visualid_t, value_mask: u32, value_list: ?*const anyopaque) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_destroy_window(conn: *xcb_connection_t, window: xcb_window_t) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_map_window(conn: *xcb_connection_t, window: xcb_window_t) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_create_gc(conn: *xcb_connection_t, cid: xcb_gcontext_t, drawable: xcb_window_t, value_mask: u32, value_list: ?*const anyopaque) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_free_gc(conn: *xcb_connection_t, gc: xcb_gcontext_t) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_change_property(conn: *xcb_connection_t, mode: u8, window: xcb_window_t, property: xcb_atom_t, type_: xcb_atom_t, format: u8, data_len: u32, data: ?*const anyopaque) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_poll_for_event(conn: *xcb_connection_t) callconv(.c) ?*xcb_generic_event_t;
+extern "xcb" fn xcb_flush(conn: *xcb_connection_t) callconv(.c) c_int;
+extern "xcb" fn xcb_put_image(conn: *xcb_connection_t, format: u8, drawable: xcb_window_t, gc: xcb_gcontext_t, width: u16, height: u16, dst_x: i16, dst_y: i16, left_pad: u8, depth: u8, data_len: u32, data: [*]const u8) callconv(.c) xcb_void_cookie_t;
+extern "xcb" fn xcb_intern_atom(conn: *xcb_connection_t, only_if_exists: u8, name_len: u16, name: [*]const u8) callconv(.c) xcb_intern_atom_cookie_t;
+extern "xcb" fn xcb_intern_atom_reply(conn: *xcb_connection_t, cookie: xcb_intern_atom_cookie_t, err: ?*?*anyopaque) callconv(.c) ?*xcb_intern_atom_reply_t;
+
+// ── X11Window ─────────────────────────────────────────────────────────
 
 pub const X11Window = struct {
-    connection: *c.xcb_connection_t,
-    window: c.xcb_window_t,
-    screen: *c.xcb_screen_t,
-    gc: c.xcb_gcontext_t,
+    connection: *xcb_connection_t,
+    window: xcb_window_t,
+    screen: *xcb_screen_t,
+    gc: xcb_gcontext_t,
     width: u32,
     height: u32,
     is_open: bool,
-    wm_delete_window: c.xcb_atom_t,
+    wm_delete_window: xcb_atom_t,
     depth: u8,
 
     pub fn init(width: u32, height: u32, title: []const u8) !X11Window {
         // Connect to X server (pure XCB, no Xlib)
         var screen_num: c_int = 0;
-        const connection = c.xcb_connect(null, &screen_num) orelse return error.XcbConnectFailed;
-        if (c.xcb_connection_has_error(connection) != 0) {
-            c.xcb_disconnect(connection);
+        const connection = xcb_connect(null, &screen_num) orelse return error.XcbConnectFailed;
+        if (xcb_connection_has_error(connection) != 0) {
+            xcb_disconnect(connection);
             return error.XcbConnectionError;
         }
 
         // Get default screen
-        const setup = c.xcb_get_setup(connection);
-        var iter = c.xcb_setup_roots_iterator(setup);
+        const setup = xcb_get_setup(connection);
+        var iter = xcb_setup_roots_iterator(setup);
         var i: c_int = 0;
         while (i < screen_num) : (i += 1) {
-            c.xcb_screen_next(&iter);
+            xcb_screen_next(&iter);
         }
-        const screen: *c.xcb_screen_t = iter.data orelse {
-            c.xcb_disconnect(connection);
+        const screen: *xcb_screen_t = iter.data orelse {
+            xcb_disconnect(connection);
             return error.XcbNoScreen;
         };
 
         // Create window
-        const win_id = c.xcb_generate_id(connection);
-        const event_mask: u32 = c.XCB_EVENT_MASK_EXPOSURE |
-            c.XCB_EVENT_MASK_STRUCTURE_NOTIFY |
-            c.XCB_EVENT_MASK_KEY_PRESS |
-            c.XCB_EVENT_MASK_KEY_RELEASE |
-            c.XCB_EVENT_MASK_FOCUS_CHANGE;
-        const value_mask: u32 = c.XCB_CW_BACK_PIXEL | c.XCB_CW_EVENT_MASK;
+        const win_id = xcb_generate_id(connection);
+        const event_mask: u32 = XCB_EVENT_MASK_EXPOSURE |
+            XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+            XCB_EVENT_MASK_KEY_PRESS |
+            XCB_EVENT_MASK_KEY_RELEASE |
+            XCB_EVENT_MASK_FOCUS_CHANGE;
+        const value_mask: u32 = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
         const value_list = [2]u32{ screen.black_pixel, event_mask };
 
-        _ = c.xcb_create_window(connection, c.XCB_COPY_FROM_PARENT, win_id, screen.root, 0, 0, @intCast(width), @intCast(height), 0, c.XCB_WINDOW_CLASS_INPUT_OUTPUT, screen.root_visual, value_mask, &value_list);
+        _ = xcb_create_window(connection, XCB_COPY_FROM_PARENT, win_id, screen.root, 0, 0, @intCast(width), @intCast(height), 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen.root_visual, value_mask, &value_list);
 
         // Graphics context
-        const gc = c.xcb_generate_id(connection);
-        _ = c.xcb_create_gc(connection, gc, win_id, 0, null);
+        const gc = xcb_generate_id(connection);
+        _ = xcb_create_gc(connection, gc, win_id, 0, null);
 
         // WM_CLASS
         const wm_class = "teru\x00teru\x00";
-        _ = c.xcb_change_property(connection, c.XCB_PROP_MODE_REPLACE, win_id, c.XCB_ATOM_WM_CLASS, c.XCB_ATOM_STRING, 8, wm_class.len, wm_class.ptr);
+        _ = xcb_change_property(connection, XCB_PROP_MODE_REPLACE, win_id, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, wm_class.len, wm_class.ptr);
 
         // _NET_WM_NAME (EWMH)
         const utf8_atom = internAtom(connection, "UTF8_STRING", false);
         const net_wm_name = internAtom(connection, "_NET_WM_NAME", false);
-        _ = c.xcb_change_property(connection, c.XCB_PROP_MODE_REPLACE, win_id, net_wm_name, utf8_atom, 8, @intCast(title.len), title.ptr);
-        _ = c.xcb_change_property(connection, c.XCB_PROP_MODE_REPLACE, win_id, c.XCB_ATOM_WM_NAME, c.XCB_ATOM_STRING, 8, @intCast(title.len), title.ptr);
+        _ = xcb_change_property(connection, XCB_PROP_MODE_REPLACE, win_id, net_wm_name, utf8_atom, 8, @intCast(title.len), title.ptr);
+        _ = xcb_change_property(connection, XCB_PROP_MODE_REPLACE, win_id, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, @intCast(title.len), title.ptr);
 
         // WM_PROTOCOLS + WM_DELETE_WINDOW
         const wm_protocols = internAtom(connection, "WM_PROTOCOLS", false);
         const wm_delete = internAtom(connection, "WM_DELETE_WINDOW", false);
-        _ = c.xcb_change_property(connection, c.XCB_PROP_MODE_REPLACE, win_id, wm_protocols, c.XCB_ATOM_ATOM, 32, 1, @as(*const u32, &wm_delete));
+        _ = xcb_change_property(connection, XCB_PROP_MODE_REPLACE, win_id, wm_protocols, XCB_ATOM_ATOM, 32, 1, @as(*const u32, &wm_delete));
 
         // Map window
-        _ = c.xcb_map_window(connection, win_id);
-        _ = c.xcb_flush(connection);
+        _ = xcb_map_window(connection, win_id);
+        _ = xcb_flush(connection);
 
         return X11Window{
             .connection = connection,
@@ -94,22 +248,22 @@ pub const X11Window = struct {
     }
 
     pub fn deinit(self: *X11Window) void {
-        _ = c.xcb_free_gc(self.connection, self.gc);
-        _ = c.xcb_destroy_window(self.connection, self.window);
-        _ = c.xcb_flush(self.connection);
-        c.xcb_disconnect(self.connection);
+        _ = xcb_free_gc(self.connection, self.gc);
+        _ = xcb_destroy_window(self.connection, self.window);
+        _ = xcb_flush(self.connection);
+        xcb_disconnect(self.connection);
         self.is_open = false;
     }
 
     pub fn pollEvents(self: *X11Window) ?Event {
-        const raw_event = c.xcb_poll_for_event(self.connection) orelse return null;
+        const raw_event = xcb_poll_for_event(self.connection) orelse return null;
         defer std.c.free(raw_event);
         const response_type: u8 = raw_event.*.response_type & 0x7f;
 
         return switch (response_type) {
-            c.XCB_EXPOSE => .expose,
-            c.XCB_CONFIGURE_NOTIFY => {
-                const cfg: *const c.xcb_configure_notify_event_t = @ptrCast(@alignCast(raw_event));
+            XCB_EXPOSE => .expose,
+            XCB_CONFIGURE_NOTIFY => {
+                const cfg: *const xcb_configure_notify_event_t = @ptrCast(@alignCast(raw_event));
                 const new_w: u32 = @intCast(cfg.width);
                 const new_h: u32 = @intCast(cfg.height);
                 if (new_w != self.width or new_h != self.height) {
@@ -119,24 +273,24 @@ pub const X11Window = struct {
                 }
                 return .none;
             },
-            c.XCB_KEY_PRESS => {
-                const key: *const c.xcb_key_press_event_t = @ptrCast(@alignCast(raw_event));
+            XCB_KEY_PRESS => {
+                const key: *const xcb_key_press_event_t = @ptrCast(@alignCast(raw_event));
                 return .{ .key_press = .{ .keycode = @intCast(key.detail), .modifiers = @intCast(key.state) } };
             },
-            c.XCB_KEY_RELEASE => {
-                const key: *const c.xcb_key_release_event_t = @ptrCast(@alignCast(raw_event));
+            XCB_KEY_RELEASE => {
+                const key: *const xcb_key_release_event_t = @ptrCast(@alignCast(raw_event));
                 return .{ .key_release = .{ .keycode = @intCast(key.detail), .modifiers = @intCast(key.state) } };
             },
-            c.XCB_CLIENT_MESSAGE => {
-                const msg: *const c.xcb_client_message_event_t = @ptrCast(@alignCast(raw_event));
+            XCB_CLIENT_MESSAGE => {
+                const msg: *const xcb_client_message_event_t = @ptrCast(@alignCast(raw_event));
                 if (msg.data.data32[0] == self.wm_delete_window) {
                     self.is_open = false;
                     return .close;
                 }
                 return .none;
             },
-            c.XCB_FOCUS_IN => .focus_in,
-            c.XCB_FOCUS_OUT => .focus_out,
+            XCB_FOCUS_IN => .focus_in,
+            XCB_FOCUS_OUT => .focus_out,
             else => .none,
         };
     }
@@ -149,8 +303,8 @@ pub const X11Window = struct {
         const data: [*]const u8 = @ptrCast(pixels.ptr);
         const row_bytes = fb_width * 4;
 
-        _ = c.xcb_put_image(self.connection, c.XCB_IMAGE_FORMAT_Z_PIXMAP, self.window, self.gc, @intCast(blit_w), @intCast(blit_h), 0, 0, 0, self.depth, blit_h * row_bytes, data);
-        _ = c.xcb_flush(self.connection);
+        _ = xcb_put_image(self.connection, XCB_IMAGE_FORMAT_Z_PIXMAP, self.window, self.gc, @intCast(blit_w), @intCast(blit_h), 0, 0, 0, self.depth, blit_h * row_bytes, data);
+        _ = xcb_flush(self.connection);
     }
 
     pub fn getSize(self: *const X11Window) platform.Size {
@@ -158,10 +312,10 @@ pub const X11Window = struct {
     }
 };
 
-fn internAtom(conn: *c.xcb_connection_t, name: [*:0]const u8, only_if_exists: bool) c.xcb_atom_t {
+fn internAtom(conn: *xcb_connection_t, name: [*:0]const u8, only_if_exists: bool) xcb_atom_t {
     const name_len: u16 = @intCast(std.mem.len(name));
-    const cookie = c.xcb_intern_atom(conn, @intFromBool(only_if_exists), name_len, name);
-    const reply = c.xcb_intern_atom_reply(conn, cookie, null) orelse return c.XCB_ATOM_NONE;
+    const cookie = xcb_intern_atom(conn, @intFromBool(only_if_exists), name_len, name);
+    const reply = xcb_intern_atom_reply(conn, cookie, null) orelse return XCB_ATOM_NONE;
     defer std.c.free(reply);
     return reply.*.atom;
 }

@@ -369,7 +369,7 @@ fn writeNodeJson(node: *const ProcessGraph.Node, writer: anytype) !void {
     try writer.print("{d}", .{node.id});
 
     try writer.writeAll(",\"name\":\"");
-    try writer.writeAll(node.name);
+    try writeJsonEscaped(node.name, writer);
 
     try writer.writeAll("\",\"kind\":\"");
     try writer.writeAll(@tagName(node.kind));
@@ -401,13 +401,33 @@ fn writeNodeJson(node: *const ProcessGraph.Node, writer: anytype) !void {
     // agent metadata
     if (node.agent) |agent| {
         try writer.writeAll(",\"agent\":{\"group\":\"");
-        try writer.writeAll(agent.group);
+        try writeJsonEscaped(agent.group, writer);
         try writer.writeAll("\",\"role\":\"");
-        try writer.writeAll(agent.role);
+        try writeJsonEscaped(agent.role, writer);
         try writer.writeAll("\"}");
     }
 
     try writer.writeByte('}');
+}
+
+/// Write a string with JSON special characters escaped.
+fn writeJsonEscaped(s: []const u8, writer: anytype) !void {
+    for (s) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => |b| {
+                if (b < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{b});
+                } else {
+                    try writer.writeByte(b);
+                }
+            },
+        }
+    }
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────

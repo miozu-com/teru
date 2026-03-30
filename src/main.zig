@@ -93,7 +93,9 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                     const new_cols: u16 = @intCast(sz.width / atlas.cell_width);
                     const new_rows: u16 = @intCast(sz.height / atlas.cell_height);
                     if (new_cols != grid.cols or new_rows != grid.rows) {
-                        grid.resize(allocator, new_rows, new_cols) catch {};
+                        grid.resize(allocator, new_rows, new_cols) catch {
+                            continue; // Grid keeps old size; skip PTY resize to avoid mismatch
+                        };
                         pty.resize(new_rows, new_cols);
                     }
                 },

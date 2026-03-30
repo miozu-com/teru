@@ -57,10 +57,75 @@ pub fn init(grid: *Grid) VtParser {
 }
 
 /// Feed a slice of bytes into the parser.
+/// Uses SIMD fast-path to skip runs of printable ASCII when in ground state.
 pub fn feed(self: *VtParser, data: []const u8) void {
-    for (data) |byte| {
-        self.processByte(byte);
+    var i: usize = 0;
+    while (i < data.len) {
+        // Fast-path: when in ground state, scan ahead for the next byte
+        // that needs special handling (ESC or any C0 control char < 0x20).
+        // All bytes 0x20..0xFF are printable and can be batched into the grid.
+        if (self.state == .ground) {
+            const remaining = data[i..];
+            const special = findNextSpecial(remaining);
+
+            if (special > 0) {
+                // Batch-write the printable run directly into the grid.
+                self.writeGroundBatch(remaining[0..special]);
+                i += special;
+                continue;
+            }
+        }
+
+        self.processByte(data[i]);
+        i += 1;
     }
+}
+
+/// SIMD-accelerated scan for special bytes (control chars) in the input buffer.
+/// Returns the index of the first byte < 0x20 (ESC, CR, LF, BS, TAB, BEL, etc.),
+/// or input.len if the entire buffer is printable (0x20..0xFF).
+fn findNextSpecial(input: []const u8) usize {
+    const Vec16 = @Vector(16, u8);
+    const threshold: Vec16 = @splat(0x20);
+
+    var i: usize = 0;
+
+    // SIMD path: 16 bytes at a time
+    while (i + 16 <= input.len) : (i += 16) {
+        const chunk: Vec16 = input[i..][0..16].*;
+        // Any byte < 0x20 is a control character that needs special handling
+        const cmp = chunk < threshold;
+        const mask: u16 = @bitCast(cmp);
+        if (mask != 0) {
+            return i + @ctz(mask);
+        }
+    }
+
+    // Scalar fallback for remaining bytes
+    while (i < input.len) : (i += 1) {
+        if (input[i] < 0x20) return i;
+    }
+
+    return input.len;
+}
+
+/// Batch-write a run of printable bytes (all >= 0x20) into the grid.
+/// Avoids per-byte state machine overhead for the common case of plain text.
+fn writeGroundBatch(self: *VtParser, run: []const u8) void {
+    const grid = self.grid;
+    for (run) |byte| {
+        if (grid.cursor_col >= grid.cols) {
+            grid.cursor_col = 0;
+            grid.cursorDown();
+        }
+        const cell = grid.cellAt(grid.cursor_row, grid.cursor_col);
+        cell.char = @as(u21, byte);
+        cell.fg = grid.pen_fg;
+        cell.bg = grid.pen_bg;
+        cell.attrs = grid.pen_attrs;
+        grid.cursor_col += 1;
+    }
+    if (run.len > 0) grid.dirty = true;
 }
 
 /// Process a single byte through the state machine.
@@ -848,4 +913,102 @@ test "scroll region" {
     // Cursor should go home
     try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
     try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+}
+
+// ── SIMD fast-path tests ────────────────────────────────────────
+
+test "SIMD findNextSpecial — ESC at various positions" {
+    // ESC at position 0
+    try std.testing.expectEqual(@as(usize, 0), findNextSpecial("\x1bHello"));
+
+    // ESC after a few chars
+    try std.testing.expectEqual(@as(usize, 5), findNextSpecial("Hello\x1b[31m"));
+
+    // ESC at position 16 (past one SIMD chunk)
+    const buf16 = "0123456789ABCDEF\x1b";
+    try std.testing.expectEqual(@as(usize, 16), findNextSpecial(buf16));
+
+    // ESC at position 17 (in scalar fallback after one full chunk)
+    const buf17 = "0123456789ABCDEFG\x1b";
+    try std.testing.expectEqual(@as(usize, 17), findNextSpecial(buf17));
+}
+
+test "SIMD findNextSpecial — no special bytes (pure printable text)" {
+    // Short buffer (< 16 bytes, scalar only)
+    try std.testing.expectEqual(@as(usize, 5), findNextSpecial("Hello"));
+
+    // Exactly 16 bytes
+    try std.testing.expectEqual(@as(usize, 16), findNextSpecial("0123456789ABCDEF"));
+
+    // 32 bytes (two full SIMD chunks)
+    try std.testing.expectEqual(@as(usize, 32), findNextSpecial("0123456789ABCDEF0123456789ABCDEF"));
+
+    // 20 bytes (one SIMD chunk + 4 scalar)
+    try std.testing.expectEqual(@as(usize, 20), findNextSpecial("0123456789ABCDEFGHIJ"));
+}
+
+test "SIMD findNextSpecial — control chars other than ESC" {
+    // Newline
+    try std.testing.expectEqual(@as(usize, 3), findNextSpecial("ABC\n"));
+
+    // Carriage return
+    try std.testing.expectEqual(@as(usize, 0), findNextSpecial("\r"));
+
+    // Tab
+    try std.testing.expectEqual(@as(usize, 2), findNextSpecial("AB\tC"));
+
+    // BEL
+    try std.testing.expectEqual(@as(usize, 4), findNextSpecial("ABCD\x07"));
+}
+
+test "SIMD findNextSpecial — empty input" {
+    try std.testing.expectEqual(@as(usize, 0), findNextSpecial(""));
+}
+
+test "SIMD fast-path — batched ground write produces same result as byte-by-byte" {
+    const allocator = std.testing.allocator;
+
+    // Reference: byte-by-byte through processByte
+    var grid_ref = try Grid.init(allocator, 24, 80);
+    defer grid_ref.deinit(allocator);
+    var parser_ref = VtParser.init(&grid_ref);
+    const text = "The quick brown fox jumps over the lazy dog!";
+    for (text) |byte| {
+        parser_ref.processByte(byte);
+    }
+
+    // Test: batched via feed() SIMD fast-path
+    var grid_simd = try Grid.init(allocator, 24, 80);
+    defer grid_simd.deinit(allocator);
+    var parser_simd = VtParser.init(&grid_simd);
+    parser_simd.feed(text);
+
+    // Both grids must match
+    try std.testing.expectEqual(grid_ref.cursor_row, grid_simd.cursor_row);
+    try std.testing.expectEqual(grid_ref.cursor_col, grid_simd.cursor_col);
+    for (0..text.len) |col| {
+        const ref_cell = grid_ref.cellAtConst(0, @intCast(col));
+        const simd_cell = grid_simd.cellAtConst(0, @intCast(col));
+        try std.testing.expectEqual(ref_cell.char, simd_cell.char);
+    }
+}
+
+test "SIMD fast-path — mixed text and escapes" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(&grid);
+
+    // Text, then escape, then more text
+    parser.feed("Hello\x1b[1mWorld");
+
+    // "Hello" at cols 0-4
+    try std.testing.expectEqual(@as(u21, 'H'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'o'), grid.cellAtConst(0, 4).char);
+    try std.testing.expect(!grid.cellAtConst(0, 0).attrs.bold);
+
+    // "World" at cols 5-9, bold
+    try std.testing.expectEqual(@as(u21, 'W'), grid.cellAtConst(0, 5).char);
+    try std.testing.expectEqual(@as(u21, 'd'), grid.cellAtConst(0, 9).char);
+    try std.testing.expect(grid.cellAtConst(0, 5).attrs.bold);
 }
