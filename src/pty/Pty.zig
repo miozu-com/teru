@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const compat = @import("../compat.zig");
 
 const Pty = @This();
 
@@ -151,8 +152,7 @@ pub fn isAlive(self: *const Pty) bool {
 // ── Private helpers ──────────────────────────────────────────────
 
 fn getDefaultShell() []const u8 {
-    if (std.c.getenv("SHELL")) |ptr| return std.mem.sliceTo(ptr, 0);
-    return "/bin/sh";
+    return compat.getenv("SHELL") orelse "/bin/sh";
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

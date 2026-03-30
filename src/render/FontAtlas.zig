@@ -200,8 +200,7 @@ fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     // Try HOME/.local/share/fonts
-    if (std.c.getenv("HOME")) |home_ptr| {
-        const home = std.mem.sliceTo(home_ptr, 0);
+    if (compat.getenv("HOME")) |home| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/.local/share/fonts/{s}", .{ home, font_name });
             if (compat.access(path)) {

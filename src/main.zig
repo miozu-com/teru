@@ -3,13 +3,9 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const Pty = @import("pty/Pty.zig");
-const Grid = @import("core/Grid.zig");
-const VtParser = @import("core/VtParser.zig");
-const Pane = @import("core/Pane.zig");
 const Multiplexer = @import("core/Multiplexer.zig");
 const ProcessGraph = @import("graph/ProcessGraph.zig");
 const Terminal = @import("core/Terminal.zig");
-const Session = @import("persist/Session.zig");
 const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
 const protocol = @import("agent/protocol.zig");
@@ -17,12 +13,12 @@ const build_options = @import("build_options");
 const Config = @import("config/Config.zig");
 const Hooks = @import("config/Hooks.zig");
 const Selection = @import("core/Selection.zig");
+const Clipboard = @import("core/Clipboard.zig");
+const KeyHandler = @import("core/KeyHandler.zig");
 const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
     @import("platform/linux/keyboard.zig").Keyboard
 else
     void;
-
-const compat = @import("compat.zig");
 
 const version = "0.1.0";
 
@@ -67,30 +63,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     return runWindowedMode(allocator);
 }
-
-// ── Prefix key state ──────────────────────────────────────────────
-
-const PrefixState = struct {
-    awaiting: bool = false,
-    timestamp_ns: i128 = 0,
-
-    const TIMEOUT_NS: i128 = 1_000_000_000; // 1 second
-
-    fn activate(self: *PrefixState) void {
-        self.awaiting = true;
-        self.timestamp_ns = compat.nanoTimestamp();
-    }
-
-    fn isExpired(self: *const PrefixState) bool {
-        if (!self.awaiting) return false;
-        const elapsed = compat.nanoTimestamp() - self.timestamp_ns;
-        return elapsed > TIMEOUT_NS;
-    }
-
-    fn reset(self: *PrefixState) void {
-        self.awaiting = false;
-    }
-};
 
 fn runWindowedMode(allocator: std.mem.Allocator) !void {
     // Load configuration from ~/.config/teru/teru.conf (defaults if missing)
@@ -146,7 +118,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
         if (keyboard) |*kb| kb.deinit();
     };
 
-    var prefix = PrefixState{};
+    var prefix = KeyHandler.PrefixState{};
     var selection = Selection{};
     _ = &selection;
     var mouse_down = false;
@@ -197,7 +169,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                             if (prefix.awaiting) {
                                 prefix.reset();
                                 if (len > 0) {
-                                    handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, allocator, grid_rows, grid_cols);
+                                    KeyHandler.handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, grid_rows, grid_cols);
                                     continue;
                                 }
                             }
@@ -214,7 +186,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         if (prefix.awaiting) {
                             prefix.reset();
                             if (key.keycode < 128) {
-                                handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, allocator, grid_rows, grid_cols);
+                                KeyHandler.handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, grid_rows, grid_cols);
                                 continue;
                             }
                         }
@@ -248,7 +220,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         .middle => {
                             // Paste from clipboard
                             if (mux.getActivePane()) |pane| {
-                                pasteFromClipboard(&pane.pty);
+                                Clipboard.paste(&pane.pty);
                             }
                         },
                         .scroll_up => {
@@ -273,7 +245,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                             var sel_buf: [8192]u8 = undefined;
                             const len = selection.getText(&pane.grid, &sel_buf);
                             if (len > 0) {
-                                copyToClipboard(sel_buf[0..len]);
+                                Clipboard.copy(sel_buf[0..len]);
                             }
                         }
                     }
@@ -355,156 +327,6 @@ fn loadHooks(config: *const Config, hooks: *Hooks) void {
     if (config.hook_on_close) |cmd| hooks.setHook(.close, cmd);
     if (config.hook_on_agent_start) |cmd| hooks.setHook(.agent_start, cmd);
     if (config.hook_on_session_save) |cmd| hooks.setHook(.session_save, cmd);
-}
-
-/// Handle a multiplexer command after the prefix key (Ctrl+Space).
-fn handleMuxCommand(
-    cmd: u8,
-    mux: *Multiplexer,
-    graph: *ProcessGraph,
-    hooks: *const Hooks,
-    running: *bool,
-    allocator: std.mem.Allocator,
-    grid_rows: u16,
-    grid_cols: u16,
-) void {
-    switch (cmd) {
-        'c' => {
-            // Spawn new pane
-            const id = mux.spawnPane(grid_rows, grid_cols) catch return;
-            if (mux.getPaneById(id)) |pane| {
-                _ = graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid }) catch {};
-            }
-            hooks.fire(.spawn);
-        },
-        'x' => {
-            // Close active pane
-            if (mux.getActivePane()) |pane| {
-                const id = pane.id;
-                mux.closePane(id);
-                hooks.fire(.close);
-                // If no panes left, exit
-                if (mux.panes.items.len == 0) {
-                    running.* = false;
-                }
-            }
-        },
-        'n' => mux.focusNext(),
-        'p' => mux.focusPrev(),
-        ' ' => mux.cycleLayout(),
-        'd' => {
-            // Detach: save session and exit
-            mux.saveSession(graph, "/tmp/teru-session.bin") catch {};
-            hooks.fire(.session_save);
-            running.* = false;
-        },
-        '1'...'9' => {
-            // Switch workspace (1-based → 0-based)
-            mux.switchWorkspace(cmd - '1');
-        },
-        else => {
-            // Unknown command; forward the prefix + key to active pane
-            if (mux.getActivePane()) |pane| {
-                const nul = [1]u8{0}; // Ctrl+Space = NUL
-                _ = pane.pty.write(&nul) catch {};
-                const byte = [1]u8{cmd};
-                _ = pane.pty.write(&byte) catch {};
-            }
-        },
-    }
-    _ = allocator;
-}
-
-// ── Clipboard (xclip) ────────────────────────────────────────────
-
-/// Copy text to the system clipboard via xclip (fork + exec).
-fn copyToClipboard(text: []const u8) void {
-    // Create a pipe so we can write text to xclip's stdin
-    var pipe_fds: [2]posix.fd_t = undefined;
-    if (std.c.pipe(&pipe_fds) != 0) return;
-    const read_end = pipe_fds[0];
-    const write_end = pipe_fds[1];
-
-    const fork_rc = linux.fork();
-    const pid: isize = @bitCast(fork_rc);
-    if (pid < 0) {
-        _ = posix.system.close(read_end);
-        _ = posix.system.close(write_end);
-        return;
-    }
-
-    if (pid == 0) {
-        // Child: redirect stdin to read end of pipe
-        _ = posix.system.close(write_end);
-        _ = std.c.dup2(read_end, posix.STDIN_FILENO);
-        _ = posix.system.close(read_end);
-
-        const argv = [_:null]?[*:0]const u8{
-            "xclip",
-            "-selection",
-            "clipboard",
-        };
-        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
-        // If xclip not at /usr/bin, try PATH
-        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
-        linux.exit(1);
-    }
-
-    // Parent: write text to pipe, then close
-    _ = posix.system.close(read_end);
-    _ = std.c.write(write_end, text.ptr, text.len);
-    _ = posix.system.close(write_end);
-    // Fire-and-forget — don't waitpid (SIGCHLD ignored)
-}
-
-/// Paste from the system clipboard via xclip, writing output to the PTY.
-fn pasteFromClipboard(pty: *const Pty) void {
-    // Create a pipe so we can read xclip's stdout
-    var pipe_fds: [2]posix.fd_t = undefined;
-    if (std.c.pipe(&pipe_fds) != 0) return;
-    const read_end = pipe_fds[0];
-    const write_end = pipe_fds[1];
-
-    const fork_rc = linux.fork();
-    const pid: isize = @bitCast(fork_rc);
-    if (pid < 0) {
-        _ = posix.system.close(read_end);
-        _ = posix.system.close(write_end);
-        return;
-    }
-
-    if (pid == 0) {
-        // Child: redirect stdout to write end of pipe
-        _ = posix.system.close(read_end);
-        _ = std.c.dup2(write_end, posix.STDOUT_FILENO);
-        _ = posix.system.close(write_end);
-
-        const argv = [_:null]?[*:0]const u8{
-            "xclip",
-            "-selection",
-            "clipboard",
-            "-o",
-        };
-        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        _ = posix.system.execve("/usr/bin/xclip", &argv, @ptrCast(envp));
-        linux.exit(1);
-    }
-
-    // Parent: read from pipe and write to PTY
-    _ = posix.system.close(write_end);
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = posix.read(read_end, &buf) catch break;
-        if (n == 0) break;
-        _ = pty.write(buf[0..n]) catch break;
-    }
-    _ = posix.system.close(read_end);
-
-    // Reap the child
-    var status: c_int = 0;
-    _ = std.c.waitpid(@intCast(pid), &status, 0);
 }
 
 fn runRawMode(allocator: std.mem.Allocator) !void {

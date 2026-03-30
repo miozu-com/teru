@@ -55,7 +55,7 @@ allocator: Allocator,
 pub fn load(allocator: Allocator) !Config {
     var config = Config{ .allocator = allocator };
 
-    const home = if (std.c.getenv("HOME")) |ptr| std.mem.sliceTo(ptr, 0) else return config;
+    const home = compat.getenv("HOME") orelse return config;
 
     // Build path: $HOME/.config/teru/teru.conf
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

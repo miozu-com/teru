@@ -329,12 +329,11 @@ pub fn loadFromFile(path: []const u8, allocator: Allocator) !Session {
 /// Checks $XDG_STATE_HOME/teru/sessions/ first, falls back to ~/.local/state/teru/sessions/.
 /// Caller owns the returned slice.
 pub fn getSessionDir(allocator: Allocator) ![]const u8 {
-    if (std.c.getenv("XDG_STATE_HOME")) |ptr| {
-        const state_home = std.mem.sliceTo(ptr, 0);
+    if (compat.getenv("XDG_STATE_HOME")) |state_home| {
         return std.fmt.allocPrint(allocator, "{s}/teru/sessions", .{state_home});
     }
 
-    const home = if (std.c.getenv("HOME")) |ptr| std.mem.sliceTo(ptr, 0) else return error.NoHomeDir;
+    const home = compat.getenv("HOME") orelse return error.NoHomeDir;
     return std.fmt.allocPrint(allocator, "{s}/.local/state/teru/sessions", .{home});
 }
 

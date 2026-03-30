@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const compat = @import("../../compat.zig");
 
 const enable_x11 = build_options.enable_x11;
 const enable_wayland = build_options.enable_wayland;
@@ -46,7 +47,7 @@ const DualPlatform = union(enum) {
     wayland_: wayland.WaylandWindow,
 
     pub fn init(width: u32, height: u32, title: []const u8) !DualPlatform {
-        if (std.c.getenv("WAYLAND_DISPLAY")) |_| {
+        if (compat.getenv("WAYLAND_DISPLAY") != null) {
             if (wayland.WaylandWindow.init(width, height, title)) |w| {
                 return .{ .wayland_ = w };
             } else |_| {}

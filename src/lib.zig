@@ -22,6 +22,8 @@ pub const VtParser = @import("core/VtParser.zig");
 pub const Pane = @import("core/Pane.zig");
 pub const Multiplexer = @import("core/Multiplexer.zig");
 pub const Selection = @import("core/Selection.zig");
+pub const Clipboard = @import("core/Clipboard.zig");
+pub const KeyHandler = @import("core/KeyHandler.zig");
 pub const Session = @import("persist/Session.zig");
 pub const Scrollback = @import("persist/Scrollback.zig");
 pub const LayoutEngine = @import("tiling/LayoutEngine.zig");
@@ -41,6 +43,8 @@ test {
     _ = Pane;
     _ = Multiplexer;
     _ = Selection;
+    _ = Clipboard;
+    _ = KeyHandler;
     _ = Session;
     _ = Scrollback;
     _ = LayoutEngine;

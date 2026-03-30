@@ -235,6 +235,104 @@ pub fn nanoTimestamp() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
+// ── Fork + exec helpers (replaces duplicated fork/pipe/exec) ─────
+
+/// Fork and exec a command. Fire-and-forget — parent does NOT wait.
+/// The child's stdin/stdout are inherited from the parent.
+pub fn forkExec(argv: [*:null]const ?[*:0]const u8) void {
+    const fork_rc = linux.fork();
+    const pid: isize = @bitCast(fork_rc);
+    if (pid < 0) return; // fork failed
+    if (pid == 0) {
+        // Child
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        _ = posix.system.execve(argv[0].?, argv, @ptrCast(envp));
+        linux.exit(1);
+    }
+    // Parent: fire-and-forget
+}
+
+/// Fork, pipe `data` into the child's stdin, exec command. Fire-and-forget.
+pub fn forkExecPipeStdin(argv: [*:null]const ?[*:0]const u8, data: []const u8) void {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
+    const read_end = pipe_fds[0];
+    const write_end = pipe_fds[1];
+
+    const fork_rc = linux.fork();
+    const pid: isize = @bitCast(fork_rc);
+    if (pid < 0) {
+        _ = posix.system.close(read_end);
+        _ = posix.system.close(write_end);
+        return;
+    }
+
+    if (pid == 0) {
+        // Child: redirect stdin to read end of pipe
+        _ = posix.system.close(write_end);
+        _ = std.c.dup2(read_end, posix.STDIN_FILENO);
+        _ = posix.system.close(read_end);
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        _ = posix.system.execve(argv[0].?, argv, @ptrCast(envp));
+        linux.exit(1);
+    }
+
+    // Parent: write data to pipe, then close
+    _ = posix.system.close(read_end);
+    _ = std.c.write(write_end, data.ptr, data.len);
+    _ = posix.system.close(write_end);
+}
+
+/// Fork, exec command, read child's stdout into `output_fd`. Blocks until child exits.
+pub fn forkExecReadStdout(argv: [*:null]const ?[*:0]const u8, output_fd: posix.fd_t) void {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
+    const read_end = pipe_fds[0];
+    const write_end = pipe_fds[1];
+
+    const fork_rc = linux.fork();
+    const pid: isize = @bitCast(fork_rc);
+    if (pid < 0) {
+        _ = posix.system.close(read_end);
+        _ = posix.system.close(write_end);
+        return;
+    }
+
+    if (pid == 0) {
+        // Child: redirect stdout to write end of pipe
+        _ = posix.system.close(read_end);
+        _ = std.c.dup2(write_end, posix.STDOUT_FILENO);
+        _ = posix.system.close(write_end);
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        _ = posix.system.execve(argv[0].?, argv, @ptrCast(envp));
+        linux.exit(1);
+    }
+
+    // Parent: read from pipe and write to output_fd
+    _ = posix.system.close(write_end);
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = posix.read(read_end, &buf) catch break;
+        if (n == 0) break;
+        _ = std.c.write(output_fd, buf[0..n].ptr, n);
+    }
+    _ = posix.system.close(read_end);
+
+    // Reap the child
+    var status: c_int = 0;
+    _ = std.c.waitpid(@intCast(pid), &status, 0);
+}
+
+// ── Environment (wraps std.c.getenv + sliceTo) ───────────────────
+
+/// Look up an environment variable, returning a Zig slice or null.
+/// Replaces the verbose `if (std.c.getenv("X")) |ptr| std.mem.sliceTo(ptr, 0)` pattern.
+pub fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(name) orelse return null;
+    return std.mem.sliceTo(ptr, 0);
+}
+
 // ── Sleep (replaces removed std.Thread.sleep) ────────────────────
 
 pub fn sleepNanos(ns: u64) void {

@@ -11,6 +11,7 @@
 const std = @import("std");
 const Grid = @import("../core/Grid.zig");
 const SoftwareRenderer = @import("software.zig").SoftwareRenderer;
+const compat = @import("../compat.zig");
 
 // ── Tier detection ─────────────────────────────────────────────────
 
@@ -28,8 +29,8 @@ pub const RenderTier = enum {
 
 /// Detect the best rendering tier for the current environment.
 pub fn detectTier() RenderTier {
-    if (std.c.getenv("DISPLAY") != null) return .cpu;
-    if (std.c.getenv("WAYLAND_DISPLAY") != null) return .cpu;
+    if (compat.getenv("DISPLAY") != null) return .cpu;
+    if (compat.getenv("WAYLAND_DISPLAY") != null) return .cpu;
     return .tty;
 }
 

@@ -12,6 +12,7 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const Hooks = @This();
 
 // ── Hook events ───────────────────────────────────────────────────
@@ -66,23 +67,12 @@ pub fn fire(self: *const Hooks, hook: HookEvent) void {
         .session_save => self.on_session_save,
     } orelse return;
 
-    const rc = std.os.linux.fork();
-    const pid: isize = @bitCast(rc);
-    if (pid < 0) return; // fork failed
-    if (pid == 0) {
-        // Child process: exec /bin/sh -c "<command>"
-        const argv = [_:null]?[*:0]const u8{
-            "/bin/sh",
-            "-c",
-            cmd,
-        };
-        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-        _ = posix.system.execve("/bin/sh", &argv, @ptrCast(envp));
-        // execve only returns on error — exit the child
-        std.os.linux.exit(1);
-    }
-    // Parent: fire-and-forget — don't waitpid.
-    // SIGCHLD with SA_NOCLDWAIT or ignoring prevents zombies.
+    const argv = [_:null]?[*:0]const u8{
+        "/bin/sh",
+        "-c",
+        cmd,
+    };
+    compat.forkExec(&argv);
 }
 
 // ── Internal ──────────────────────────────────────────────────────
