@@ -30,6 +30,10 @@ pub const MAX_OSC_LEN = 256;
 state: State = .ground,
 grid: *Grid,
 
+/// File descriptor for sending responses back to the PTY (DA1, DSR, etc.)
+/// Set to the PTY master fd by the Pane after init. -1 = no responses.
+response_fd: std.posix.fd_t = -1,
+
 /// CSI parameter accumulation
 params: [MAX_PARAMS]u16 = [_]u16{0} ** MAX_PARAMS,
 param_count: u8 = 0,
@@ -64,6 +68,13 @@ has_agent_event: bool = false,
 
 pub fn init(grid: *Grid) VtParser {
     return .{ .grid = grid };
+}
+
+/// Send a response back to the PTY (for DA1, DSR, etc.)
+fn sendResponse(self: *const VtParser, data: []const u8) void {
+    if (self.response_fd >= 0) {
+        _ = std.c.write(self.response_fd, data.ptr, data.len);
+    }
 }
 
 /// Create a VtParser with an undefined grid pointer.
@@ -596,6 +607,27 @@ fn dispatchCsiPrivate(self: *VtParser, final: u8) void {
                     self.grid.restoreCursor();
                 },
                 else => {},
+            }
+        },
+        'c' => {
+            // DA1 — Primary Device Attributes
+            // Respond: "I'm a VT220 with ANSI color" (what xterm reports)
+            self.sendResponse("\x1b[?62;22c");
+        },
+        'n' => {
+            // DSR — Device Status Report
+            const p = self.getParam(0, 0);
+            if (p == 5) {
+                // Status report: "I'm OK"
+                self.sendResponse("\x1b[0n");
+            } else if (p == 6) {
+                // Cursor position report: ESC[row;colR
+                var buf: [32]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
+                    self.grid.cursor_row + 1,
+                    self.grid.cursor_col + 1,
+                }) catch return;
+                self.sendResponse(msg);
             }
         },
         else => {},

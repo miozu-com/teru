@@ -43,6 +43,7 @@ pub fn init(allocator: Allocator, rows: u16, cols: u16, id: u64) !Pane {
 /// (after ArrayList.append or similar move).
 pub fn linkVt(self: *Pane) void {
     self.vt.grid = &self.grid;
+    self.vt.response_fd = self.pty.master;
 }
 
 pub fn deinit(self: *Pane, allocator: Allocator) void {
