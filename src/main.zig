@@ -142,14 +142,9 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Early PTY reads: poll for 200ms to catch shell startup queries.
-    // Fish sends prompt output FIRST, then DA1 query. DO NOT break early —
-    // keep reading the full window to process the entire startup sequence.
+    // Initial PTY read — process first batch of shell output
     if (mux.getActivePane()) |pane| {
-        for (0..20) |_| {
-            _ = pane.readAndProcess(&pty_buf) catch {};
-            io.sleep(.fromMilliseconds(10), .awake) catch {};
-        }
+        _ = pane.readAndProcess(&pty_buf) catch {};
     }
 
     while (running) {
