@@ -32,23 +32,23 @@ const Vec4u16 = @Vector(4, u16);
 const palette_256 = blk: {
     var table: [256]u32 = undefined;
 
-    // 0-15: standard colors
-    table[0] = 0xFF000000; // black
-    table[1] = 0xFFCC0000; // red
-    table[2] = 0xFF00CC00; // green
-    table[3] = 0xFFCCCC00; // yellow
-    table[4] = 0xFF0000CC; // blue
-    table[5] = 0xFFCC00CC; // magenta
-    table[6] = 0xFF00CCCC; // cyan
-    table[7] = 0xFFBFBFBF; // white
-    table[8] = 0xFF808080; // bright black
-    table[9] = 0xFFFF0000; // bright red
-    table[10] = 0xFF00FF00; // bright green
-    table[11] = 0xFFFFFF00; // bright yellow
-    table[12] = 0xFF0000FF; // bright blue
-    table[13] = 0xFFFF00FF; // bright magenta
-    table[14] = 0xFF00FFFF; // bright cyan
-    table[15] = 0xFFFFFFFF; // bright white
+    // 0-15: miozu base16 color scheme
+    table[0] = 0xFF1D1D23; // black   (miozu00)
+    table[1] = 0xFFF4517D; // red     (miozu0E)
+    table[2] = 0xFF7DB359; // green   (miozu0B)
+    table[3] = 0xFFFF9922; // yellow  (miozu0A)
+    table[4] = 0xFF8683FF; // blue    (miozu08)
+    table[5] = 0xFFCF8DFF; // magenta (miozu0D)
+    table[6] = 0xFF2DD9F0; // cyan    (miozu0C)
+    table[7] = 0xFFC9CBD7; // white   (miozu05)
+    table[8] = 0xFF64647E; // bright black   (miozu03)
+    table[9] = 0xFFC43444; // bright red     (miozu0F)
+    table[10] = 0xFF7DB359; // bright green   (miozu0B)
+    table[11] = 0xFFFF9922; // bright yellow  (miozu0A)
+    table[12] = 0xFF4385E7; // bright blue    (miozu09)
+    table[13] = 0xFFCF8DFF; // bright magenta (miozu0D)
+    table[14] = 0xFF2DD9F0; // bright cyan    (miozu0C)
+    table[15] = 0xFFFAF8FB; // bright white   (miozu07)
 
     // 16-231: 6x6x6 color cube
     for (0..216) |i| {
@@ -358,9 +358,9 @@ fn blitGlyphRow(dst: []u32, glyph_alpha: []const u8, fg: u32, bg: u32, width: us
 fn resolveColorArgb(color: Grid.Color, is_fg: bool) u32 {
     return switch (color) {
         .default => if (is_fg)
-            packArgb(230, 230, 230) // light gray foreground (0.9 * 255)
+            0xFFFAF8FB // miozu07: light foreground
         else
-            packArgb(18, 18, 26), // near-black background (0.07 * 255 ≈ 18)
+            0xFF1D1D23, // miozu00: dark background
         .indexed => |idx| indexed256Argb(idx),
         .rgb => |c| packArgb(c.r, c.g, c.b),
     };
@@ -570,10 +570,10 @@ test "performance: 5000 cells" {
 }
 
 test "color resolution: indexed 256 palette" {
-    // Index 0 = black
-    try std.testing.expectEqual(@as(u32, 0xFF000000), indexed256Argb(0));
-    // Index 15 = bright white
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), indexed256Argb(15));
+    // Index 0 = miozu black
+    try std.testing.expectEqual(@as(u32, 0xFF1D1D23), indexed256Argb(0));
+    // Index 15 = miozu bright white (FAF8FB)
+    try std.testing.expectEqual(@as(u32, 0xFFFAF8FB), indexed256Argb(15));
     // Index 232 = very dark gray (level = 8)
     try std.testing.expectEqual(packArgb(8, 8, 8), indexed256Argb(232));
     // Index 255 = near-white (level = 238)
