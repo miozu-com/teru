@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const linux = std.os.linux;
 const Pty = @import("pty/Pty.zig");
 const Multiplexer = @import("core/Multiplexer.zig");
 const ProcessGraph = @import("graph/ProcessGraph.zig");
@@ -32,13 +31,12 @@ fn outFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
     out(msg);
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = debug_alloc.allocator();
-    defer _ = debug_alloc.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
     // Parse command line args (0.16: std.process.Args.Iterator replaces argsAlloc)
-    var args_iter = std.process.Args.Iterator.init(init.args);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = args_iter.next(); // skip argv[0]
     const first_arg: ?[:0]const u8 = args_iter.next();
 
@@ -53,21 +51,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--raw")) {
-            return runRawMode(allocator);
+            return runRawMode(allocator, io);
         }
     }
 
     // Detect rendering tier
     const tier = render.detectTier();
     if (tier == .tty) {
-        return runRawMode(allocator); // No display server, fall back to TTY
+        return runRawMode(allocator, io); // No display server, fall back to TTY
     }
-    return runWindowedMode(allocator);
+    return runWindowedMode(allocator, io);
 }
 
-fn runWindowedMode(allocator: std.mem.Allocator) !void {
+fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     // Load configuration from ~/.config/teru/teru.conf (defaults if missing)
-    var config = try Config.load(allocator);
+    var config = try Config.load(allocator, io);
     defer config.deinit();
 
     var graph = ProcessGraph.init(allocator);
@@ -76,7 +74,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
     var win = try platform.Platform.init(config.initial_width, config.initial_height, "teru");
     defer win.deinit();
 
-    var atlas = try render.FontAtlas.init(allocator, config.font_path, config.font_size);
+    var atlas = try render.FontAtlas.init(allocator, config.font_path, config.font_size, io);
     defer atlas.deinit();
 
     // CPU SIMD renderer — no GPU needed (cursor color from config)
@@ -175,7 +173,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                             if (prefix.awaiting) {
                                 prefix.reset();
                                 if (len > 0) {
-                                    KeyHandler.handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, grid_rows, grid_cols);
+                                    KeyHandler.handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
                                     continue;
                                 }
                             }
@@ -192,7 +190,7 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                         if (prefix.awaiting) {
                             prefix.reset();
                             if (key.keycode < 128) {
-                                KeyHandler.handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, grid_rows, grid_cols);
+                                KeyHandler.handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
                                 continue;
                             }
                         }
@@ -350,9 +348,8 @@ fn runWindowedMode(allocator: std.mem.Allocator) !void {
                 pane.grid.dirty = false;
             }
         } else {
-            // 1ms idle sleep via linux nanosleep (Thread.sleep removed in 0.16)
-            const req = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-            _ = linux.nanosleep(&req, null);
+            // 1ms idle sleep via native Io.sleep
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
     }
 }
@@ -405,7 +402,8 @@ fn updateAgentStatusByName(graph: *ProcessGraph, name: []const u8, task: ?[]cons
     graph.updateAgentStatus(node_id, task, progress);
 }
 
-fn runRawMode(allocator: std.mem.Allocator) !void {
+fn runRawMode(allocator: std.mem.Allocator, io: std.Io) !void {
+    _ = io;
     var graph = ProcessGraph.init(allocator);
     defer graph.deinit();
 

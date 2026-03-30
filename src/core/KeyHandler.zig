@@ -5,6 +5,7 @@
 //! into these helpers rather than inlining the logic.
 
 const std = @import("std");
+const Io = std.Io;
 const Multiplexer = @import("Multiplexer.zig");
 const ProcessGraph = @import("../graph/ProcessGraph.zig");
 const Hooks = @import("../config/Hooks.zig");
@@ -45,6 +46,7 @@ pub fn handleMuxCommand(
     running: *bool,
     grid_rows: u16,
     grid_cols: u16,
+    io: Io,
 ) void {
     switch (cmd) {
         'c' => {
@@ -72,7 +74,7 @@ pub fn handleMuxCommand(
         ' ' => mux.cycleLayout(),
         'd' => {
             // Detach: save session and exit
-            mux.saveSession(graph, "/tmp/teru-session.bin") catch {};
+            mux.saveSession(graph, "/tmp/teru-session.bin", io) catch {};
             hooks.fire(.session_save);
             running.* = false;
         },

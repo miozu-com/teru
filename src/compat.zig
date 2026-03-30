@@ -1,129 +1,17 @@
 //! Compatibility layer for Zig 0.16-dev.
 //!
-//! Replaces removed APIs:
-//!   - std.fs.cwd().openFile/createFile/deleteFile → raw POSIX fd ops
-//!   - std.io.fixedBufferStream → MemStream (in-memory writer/reader)
-//!   - std.time.nanoTimestamp() → clock_gettime(REALTIME)
-//!   - std.Thread.sleep(ns) → linux.nanosleep
+//! Contains helpers that don't have a direct native Io equivalent:
+//!   - MemWriter/MemReader/DynWriter — in-memory serialization streams
+//!   - nanoTimestamp() — clock_gettime(REALTIME) for code without Io access
+//!   - getenv() — convenience wrapper around std.c.getenv
+//!   - forkExec*() — process spawning with PTY/pipe setup
+//!
+//! File I/O has been migrated to native std.Io.Dir / std.Io.File APIs.
 
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
-
-// Minimal stat struct matching Linux x86_64 struct stat (for fstat)
-const Stat = extern struct {
-    dev: u64,
-    ino: u64,
-    nlink: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    __pad0: u32 = 0,
-    rdev: u64,
-    size: i64,
-    blksize: i64,
-    blocks: i64,
-    atim: linux.timespec,
-    mtim: linux.timespec,
-    ctim: linux.timespec,
-    __unused: [3]i64 = .{ 0, 0, 0 },
-};
-
-// libc fstat — std.c.fstat is void on Linux in 0.16-dev
-extern "c" fn fstat(fd: posix.fd_t, buf: *Stat) c_int;
-
-// ── File operations (replaces removed std.fs.cwd()) ─────────────
-
-pub const File = struct {
-    fd: posix.fd_t,
-
-    pub fn close(self: File) void {
-        _ = posix.system.close(self.fd);
-    }
-
-    /// Read entire file contents into an allocator-owned buffer (up to max_bytes).
-    pub fn readToEndAlloc(self: File, allocator: Allocator, max_bytes: usize) ![]u8 {
-        // Get file size via fstat
-        var stat_buf: Stat = undefined;
-        const stat_rc = fstat(self.fd, &stat_buf);
-        if (stat_rc != 0) return error.StatFailed;
-        const size: usize = @intCast(stat_buf.size);
-        if (size > max_bytes) return error.FileTooBig;
-
-        const buf = try allocator.alloc(u8, size);
-        errdefer allocator.free(buf);
-
-        var total: usize = 0;
-        while (total < size) {
-            const n = posix.read(self.fd, buf[total..]) catch |err| switch (err) {
-                else => return error.ReadFailed,
-            };
-            if (n == 0) break;
-            total += n;
-        }
-        return buf[0..total];
-    }
-
-    /// Read all bytes into a pre-allocated buffer. Returns number of bytes read.
-    pub fn readAll(self: File, buf: []u8) !usize {
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = posix.read(self.fd, buf[total..]) catch |err| switch (err) {
-                else => return error.ReadFailed,
-            };
-            if (n == 0) break;
-            total += n;
-        }
-        return total;
-    }
-
-    pub fn writeAll(self: File, data: []const u8) !void {
-        var total: usize = 0;
-        while (total < data.len) {
-            const rc = std.c.write(self.fd, data[total..].ptr, data.len - total);
-            if (rc < 0) return error.WriteFailed;
-            if (rc == 0) return error.WriteFailed;
-            total += @intCast(rc);
-        }
-    }
-
-    /// Get file size.
-    pub fn stat(self: File) !struct { size: usize } {
-        var stat_buf: Stat = undefined;
-        const stat_rc = fstat(self.fd, &stat_buf);
-        if (stat_rc != 0) return error.StatFailed;
-        return .{ .size = @intCast(stat_buf.size) };
-    }
-};
-
-/// Open a file relative to CWD. Replaces std.fs.cwd().openFile().
-pub fn openFile(path: []const u8, comptime _: struct {}) !File {
-    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
-    return .{ .fd = fd };
-}
-
-/// Create a file relative to CWD. Replaces std.fs.cwd().createFile().
-pub fn createFile(path: []const u8, comptime _: struct {}) !File {
-    const fd = try posix.openat(posix.AT.FDCWD, path, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-    }, 0o644);
-    return .{ .fd = fd };
-}
-
-/// Check if a file is accessible (exists and readable).
-pub fn access(path: []const u8) bool {
-    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    _ = posix.system.close(fd);
-    return true;
-}
-
-/// Delete a file. Replaces std.fs.cwd().deleteFile().
-pub fn deleteFile(path_z: [*:0]const u8) void {
-    _ = std.c.unlink(path_z);
-}
 
 // ── In-memory stream (replaces removed std.io.fixedBufferStream) ──
 
@@ -333,9 +221,3 @@ pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(ptr, 0);
 }
 
-// ── Sleep (replaces removed std.Thread.sleep) ────────────────────
-
-pub fn sleepNanos(ns: u64) void {
-    const req = linux.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-    _ = linux.nanosleep(&req, null);
-}

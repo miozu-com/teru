@@ -12,6 +12,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Dir = Io.Dir;
+const File = Io.File;
 const compat = @import("../compat.zig");
 const Config = @This();
 
@@ -52,23 +55,27 @@ allocator: Allocator,
 
 /// Load configuration from ~/.config/teru/teru.conf.
 /// Returns defaults if the file does not exist.
-pub fn load(allocator: Allocator) !Config {
+pub fn load(allocator: Allocator, io: Io) !Config {
     var config = Config{ .allocator = allocator };
 
     const home = compat.getenv("HOME") orelse return config;
 
     // Build path: $HOME/.config/teru/teru.conf
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/.config/teru/teru.conf", .{home}) catch return config;
 
-    const file = compat.openFile(path, .{}) catch return config;
-    defer file.close();
+    const file = Dir.cwd().openFile(io, path, .{}) catch return config;
+    defer file.close(io);
 
     // Read the entire file (cap at 64KB — config files should be tiny)
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return config;
+    const s = file.stat(io) catch return config;
+    const size: usize = @intCast(s.size);
+    if (size > 64 * 1024) return config;
+    const content = allocator.alloc(u8, size) catch return config;
     defer allocator.free(content);
+    const n = file.readPositionalAll(io, content, 0) catch return config;
 
-    config.parse(allocator, content);
+    config.parse(allocator, content[0..n]);
     return config;
 }
 
@@ -282,7 +289,7 @@ test "missing config file returns defaults" {
     const allocator = std.testing.allocator;
 
     // load() tries ~/.config/teru/teru.conf — almost certainly missing in test env
-    var config = try Config.load(allocator);
+    var config = try Config.load(allocator, std.testing.io);
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 16), config.font_size);

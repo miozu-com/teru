@@ -5,6 +5,8 @@
 //! or accepting an explicit font path. No FreeType, no fontconfig.
 
 const std = @import("std");
+const Io = std.Io;
+const Dir = Io.Dir;
 const compat = @import("../compat.zig");
 const FontAtlas = @This();
 
@@ -37,13 +39,13 @@ cell_height: u32,
 allocator: std.mem.Allocator,
 font_data: []u8, // kept alive for stbtt
 
-pub fn init(allocator: std.mem.Allocator, font_path: ?[]const u8, font_size: u16) !FontAtlas {
+pub fn init(allocator: std.mem.Allocator, font_path: ?[]const u8, font_size: u16, io: Io) !FontAtlas {
     // Load font file
-    const path = font_path orelse try findMonospaceFont(allocator);
+    const path = font_path orelse try findMonospaceFont(allocator, io);
     const free_path = font_path == null;
     defer if (free_path) allocator.free(path);
 
-    const font_data = try loadFile(allocator, path);
+    const font_data = try loadFile(allocator, path, io);
     errdefer allocator.free(font_data);
 
     // Initialize stbtt
@@ -186,14 +188,14 @@ const preferred_fonts = [_][]const u8{
     "DroidSansMono.ttf",
 };
 
-fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
+fn findMonospaceFont(allocator: std.mem.Allocator, io: Io) ![]const u8 {
     // Try preferred fonts in standard paths
     for (font_search_paths) |dir| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, font_name });
-            if (compat.access(path)) {
+            if (Dir.cwd().access(io, path, .{ .read = true })) |_| {
                 return path;
-            } else {
+            } else |_| {
                 allocator.free(path);
             }
         }
@@ -203,9 +205,9 @@ fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
     if (compat.getenv("HOME")) |home| {
         for (preferred_fonts) |font_name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/.local/share/fonts/{s}", .{ home, font_name });
-            if (compat.access(path)) {
+            if (Dir.cwd().access(io, path, .{ .read = true })) |_| {
                 return path;
-            } else {
+            } else |_| {
                 allocator.free(path);
             }
         }
@@ -214,13 +216,17 @@ fn findMonospaceFont(allocator: std.mem.Allocator) ![]const u8 {
     return error.NoMonospaceFontFound;
 }
 
-fn loadFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try compat.openFile(path, .{});
-    defer file.close();
-    const s = try file.stat();
-    const data = try allocator.alloc(u8, s.size);
-    const n = try file.readAll(data);
-    if (n != s.size) {
+fn loadFile(allocator: std.mem.Allocator, path: []const u8, io: Io) ![]u8 {
+    const file = Dir.cwd().openFile(io, path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    const s = file.stat(io) catch return error.StatFailed;
+    const size: usize = @intCast(s.size);
+    const data = try allocator.alloc(u8, size);
+    const n = file.readPositionalAll(io, data, 0) catch {
+        allocator.free(data);
+        return error.ReadFailed;
+    };
+    if (n != size) {
         allocator.free(data);
         return error.IncompleteRead;
     }

@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Dir = Io.Dir;
 const ProcessGraph = @import("../graph/ProcessGraph.zig");
 const compat = @import("../compat.zig");
 
@@ -294,29 +296,30 @@ fn deserializeNode(reader: anytype, allocator: Allocator) !SerializedNode {
 // ── File operations ─────────────────────────────────────────────
 
 /// Serialize the graph and write to a file at the given path.
-pub fn saveToFile(graph: *const ProcessGraph, path: []const u8) !void {
+pub fn saveToFile(graph: *const ProcessGraph, path: []const u8, io: Io) !void {
     // Serialize to dynamic memory buffer
     var dyn = compat.DynWriter{ .allocator = std.heap.page_allocator };
     defer dyn.deinit();
     try serialize(graph, &dyn);
 
     // Write to file
-    const file = try compat.createFile(path, .{});
-    defer file.close();
-    try file.writeAll(dyn.getWritten());
+    const file = Dir.cwd().createFile(io, path, .{}) catch return error.CreateFailed;
+    defer file.close(io);
+    file.writeStreamingAll(io, dyn.getWritten()) catch return error.WriteFailed;
 }
 
 /// Read a session from a file at the given path.
 /// Caller owns the returned Session and must call deinit().
-pub fn loadFromFile(path: []const u8, allocator: Allocator) !Session {
-    const file = try compat.openFile(path, .{});
-    defer file.close();
+pub fn loadFromFile(path: []const u8, allocator: Allocator, io: Io) !Session {
+    const file = Dir.cwd().openFile(io, path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
 
     // Read file into dynamic buffer
-    const s = try file.stat();
-    const data = try allocator.alloc(u8, s.size);
+    const s = file.stat(io) catch return error.StatFailed;
+    const size: usize = @intCast(s.size);
+    const data = try allocator.alloc(u8, size);
     defer allocator.free(data);
-    const n = try file.readAll(data);
+    const n = file.readPositionalAll(io, data, 0) catch return error.ReadFailed;
 
     // Deserialize from memory
     var reader = compat.MemReader{ .buffer = data[0..n] };
@@ -491,6 +494,7 @@ test "agent metadata round-trip" {
 
 test "file save and load round-trip" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var graph = ProcessGraph.init(allocator);
     defer graph.deinit();
 
@@ -512,10 +516,10 @@ test "file save and load round-trip" {
     const tmp_path = "/tmp/teru-session-test.bin";
 
     // Save
-    try saveToFile(&graph, tmp_path);
+    try saveToFile(&graph, tmp_path, io);
 
     // Load
-    var session = try loadFromFile(tmp_path, allocator);
+    var session = try loadFromFile(tmp_path, allocator, io);
     defer session.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), session.graph_snapshot.len);
@@ -545,5 +549,5 @@ test "file save and load round-trip" {
     try std.testing.expect(found_lead);
 
     // Clean up temp file
-    compat.deleteFile("/tmp/teru-session-test.bin");
+    Dir.cwd().deleteFile(io, "/tmp/teru-session-test.bin") catch {};
 }

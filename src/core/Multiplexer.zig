@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const Pane = @import("Pane.zig");
 const Grid = @import("Grid.zig");
 const LayoutEngine = @import("../tiling/LayoutEngine.zig");
@@ -525,9 +526,9 @@ fn insetRect(rect: Rect, n: u16) Rect {
 // ── Session persistence ────────────────────────────────────────
 
 /// Save session state to a file. This serializes the process graph.
-pub fn saveSession(self: *Multiplexer, graph: *const ProcessGraph, path: []const u8) !void {
+pub fn saveSession(self: *Multiplexer, graph: *const ProcessGraph, path: []const u8, io: Io) !void {
     _ = self;
-    try Session.saveToFile(graph, path);
+    try Session.saveToFile(graph, path, io);
 }
 
 // ── Color helpers (duplicated from software.zig to avoid coupling) ──
