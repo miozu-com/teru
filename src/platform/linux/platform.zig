@@ -28,6 +28,7 @@ pub const MouseButton = types.MouseButton;
 pub const MouseEvent = types.MouseEvent;
 pub const Event = types.Event;
 pub const Size = types.Size;
+pub const X11Info = types.X11Info;
 
 // When both backends are enabled, use a tagged union for runtime dispatch.
 // When only one backend is enabled, the Platform is a thin wrapper around it
@@ -82,6 +83,14 @@ const DualPlatform = union(enum) {
             .wayland_ => |*w| w.getSize(),
         };
     }
+
+    /// Get X11 connection info for keyboard layout query. Null on Wayland.
+    pub fn getX11Info(self: *const DualPlatform) ?X11Info {
+        return switch (self.*) {
+            .x11 => |*w| w.getX11Info(),
+            .wayland_ => null,
+        };
+    }
 };
 
 // ── X11-only: zero-cost wrapper ─────────────────────────────────
@@ -108,6 +117,10 @@ const X11Only = struct {
     pub fn getSize(self: *const X11Only) Size {
         return self.inner.getSize();
     }
+
+    pub fn getX11Info(self: *const X11Only) ?X11Info {
+        return self.inner.getX11Info();
+    }
 };
 
 // ── Wayland-only: zero-cost wrapper ─────────────────────────────
@@ -133,5 +146,9 @@ const WaylandOnly = struct {
 
     pub fn getSize(self: *const WaylandOnly) Size {
         return self.inner.getSize();
+    }
+
+    pub fn getX11Info(_: *const WaylandOnly) ?X11Info {
+        return null; // Wayland uses wl_keyboard.keymap, not X11 properties
     }
 };

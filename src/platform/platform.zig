@@ -11,6 +11,7 @@ pub const KeyEvent = @import("types.zig").KeyEvent;
 pub const MouseButton = @import("types.zig").MouseButton;
 pub const MouseEvent = @import("types.zig").MouseEvent;
 pub const Size = @import("types.zig").Size;
+pub const X11Info = @import("types.zig").X11Info;
 
 pub const Platform = if (builtin.os.tag == .linux)
     @import("linux/platform.zig").Platform

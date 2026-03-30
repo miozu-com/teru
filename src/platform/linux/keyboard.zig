@@ -1,7 +1,9 @@
 //! Keyboard input translation via xkbcommon.
 //! Converts raw XCB keycodes to UTF-8 text and named keys.
+//! Reads the active keyboard layout from the X11 server (zero hardcoding).
 
 const std = @import("std");
+const compat = @import("../../compat.zig");
 
 // ── xkbcommon externs (extern linkage against libxkbcommon) ─────────
 
@@ -14,16 +16,6 @@ const xkb_keysym_t = u32;
 extern "xkbcommon" fn xkb_context_new(flags: u32) callconv(.c) ?*xkb_context;
 extern "xkbcommon" fn xkb_context_unref(ctx: *xkb_context) callconv(.c) void;
 extern "xkbcommon" fn xkb_keymap_new_from_names(ctx: *xkb_context, names: ?*const XkbRuleNames, flags: u32) callconv(.c) ?*xkb_keymap;
-
-/// RMLVO rule names for xkb_keymap_new_from_names.
-/// Mirrors struct xkb_rule_names from xkbcommon.h.
-const XkbRuleNames = extern struct {
-    rules: ?[*:0]const u8 = null,
-    model: ?[*:0]const u8 = null,
-    layout: ?[*:0]const u8 = null,
-    variant: ?[*:0]const u8 = null,
-    options: ?[*:0]const u8 = null,
-};
 extern "xkbcommon" fn xkb_keymap_unref(keymap: *xkb_keymap) callconv(.c) void;
 extern "xkbcommon" fn xkb_state_new(keymap: *xkb_keymap) callconv(.c) ?*xkb_state;
 extern "xkbcommon" fn xkb_state_unref(state: *xkb_state) callconv(.c) void;
@@ -31,7 +23,13 @@ extern "xkbcommon" fn xkb_state_key_get_utf8(state: *xkb_state, key: xkb_keycode
 extern "xkbcommon" fn xkb_state_key_get_one_sym(state: *xkb_state, key: xkb_keycode_t) callconv(.c) xkb_keysym_t;
 extern "xkbcommon" fn xkb_state_update_key(state: *xkb_state, key: xkb_keycode_t, direction: u32) callconv(.c) u32;
 
-// ── XKB key direction ──────────────────────────────────────────────
+const XkbRuleNames = extern struct {
+    rules: ?[*:0]const u8 = null,
+    model: ?[*:0]const u8 = null,
+    layout: ?[*:0]const u8 = null,
+    variant: ?[*:0]const u8 = null,
+    options: ?[*:0]const u8 = null,
+};
 
 const XKB_KEY_DOWN: u32 = 1;
 const XKB_KEY_UP: u32 = 0;
@@ -70,26 +68,20 @@ pub const Keyboard = struct {
     keymap: *xkb_keymap,
     state: *xkb_state,
 
+    /// Initialize keyboard with the active system layout.
+    /// Resolution order (first success wins):
+    ///   1. XKB_DEFAULT_* env vars (set by some desktop environments)
+    ///   2. System default (xkbcommon's built-in fallback)
+    /// No hardcoded layouts. Works for any language/variant.
     pub fn init() !Keyboard {
         const ctx = xkb_context_new(0) orelse return error.XkbContextFailed;
         errdefer xkb_context_unref(ctx);
 
-        // Query the active X11 keyboard layout via XKB_DEFAULT_* env vars
-        // (set by setxkbmap) or fall back to system defaults.
-        // xkbcommon checks these env vars when the field is null:
-        //   XKB_DEFAULT_RULES, XKB_DEFAULT_MODEL, XKB_DEFAULT_LAYOUT,
-        //   XKB_DEFAULT_VARIANT, XKB_DEFAULT_OPTIONS
-        // Passing null for all fields lets xkbcommon pick them up.
-        // If env vars aren't set, we explicitly try common X11 config.
-        const compat = @import("../../compat.zig");
-        const names = XkbRuleNames{
-            .rules = null, // xkbcommon checks XKB_DEFAULT_RULES
-            .model = null, // xkbcommon checks XKB_DEFAULT_MODEL
-            .layout = if (compat.getenv("XKB_DEFAULT_LAYOUT")) |l| @ptrCast(l.ptr) else null,
-            .variant = if (compat.getenv("XKB_DEFAULT_VARIANT")) |v| @ptrCast(v.ptr) else null,
-            .options = if (compat.getenv("XKB_DEFAULT_OPTIONS")) |o| @ptrCast(o.ptr) else null,
-        };
-        const keymap = xkb_keymap_new_from_names(ctx, &names, 0) orelse {
+        // Pass null — xkbcommon checks XKB_DEFAULT_LAYOUT, XKB_DEFAULT_VARIANT,
+        // XKB_DEFAULT_OPTIONS, XKB_DEFAULT_MODEL, XKB_DEFAULT_RULES env vars.
+        // If none set, uses system/X11 defaults. This handles all layouts
+        // (dvorak, colemak, azerty, CJK IME, etc.) without any hardcoding.
+        const keymap = xkb_keymap_new_from_names(ctx, null, 0) orelse {
             return error.XkbKeymapFailed;
         };
         errdefer xkb_keymap_unref(keymap);
@@ -101,6 +93,35 @@ pub const Keyboard = struct {
         return .{ .ctx = ctx, .keymap = keymap, .state = state };
     }
 
+    /// Initialize keyboard with an explicit XCB connection.
+    /// Queries _XKB_RULES_NAMES from the X root window to get the
+    /// live layout (set by setxkbmap). Falls back to env vars / defaults.
+    pub fn initFromX11(xcb_conn: *anyopaque, root_window: u32) !Keyboard {
+        const ctx = xkb_context_new(0) orelse return error.XkbContextFailed;
+        errdefer xkb_context_unref(ctx);
+
+        // Try to read the active keymap from X11 root window property
+        var names = XkbRuleNames{};
+        var rmlvo_buf: [1024]u8 = undefined;
+        if (queryX11Layout(xcb_conn, root_window, &rmlvo_buf)) |rmlvo| {
+            names = rmlvo;
+        }
+        // If query failed, names stays all-null → xkbcommon uses defaults
+
+        const keymap = xkb_keymap_new_from_names(ctx, &names, 0) orelse {
+            // Fallback: try with pure defaults
+            const fallback = xkb_keymap_new_from_names(ctx, null, 0) orelse {
+                return error.XkbKeymapFailed;
+            };
+            const state = xkb_state_new(fallback) orelse return error.XkbStateFailed;
+            return .{ .ctx = ctx, .keymap = fallback, .state = state };
+        };
+        errdefer xkb_keymap_unref(keymap);
+
+        const state = xkb_state_new(keymap) orelse return error.XkbStateFailed;
+        return .{ .ctx = ctx, .keymap = keymap, .state = state };
+    }
+
     pub fn deinit(self: *Keyboard) void {
         xkb_state_unref(self.state);
         xkb_keymap_unref(self.keymap);
@@ -108,37 +129,104 @@ pub const Keyboard = struct {
     }
 
     /// Translate a raw XCB keycode to bytes for the PTY.
-    /// XCB keycodes are evdev + 8, which is what xkbcommon expects.
-    /// Returns the number of bytes written to buf.
     pub fn processKey(self: *Keyboard, keycode: u32, pressed: bool, buf: []u8) usize {
-        const xkb_key = keycode;
-
         if (pressed) {
-            _ = xkb_state_update_key(self.state, xkb_key, XKB_KEY_DOWN);
+            _ = xkb_state_update_key(self.state, keycode, XKB_KEY_DOWN);
         } else {
-            _ = xkb_state_update_key(self.state, xkb_key, XKB_KEY_UP);
-            return 0; // Only generate output on key press, not release
-        }
-
-        // Check for special keys that produce escape sequences
-        const keysym = xkb_state_key_get_one_sym(self.state, xkb_key);
-        const special = keysymToEscape(keysym);
-        if (special.len > 0) {
-            if (special.len <= buf.len) {
-                @memcpy(buf[0..special.len], special);
-                return special.len;
-            }
+            _ = xkb_state_update_key(self.state, keycode, XKB_KEY_UP);
             return 0;
         }
 
-        // Get UTF-8 text for printable keys
-        if (buf.len == 0) return 0;
-        const n = xkb_state_key_get_utf8(self.state, xkb_key, buf.ptr, buf.len);
+        const keysym = xkb_state_key_get_one_sym(self.state, keycode);
+        const special = keysymToEscape(keysym);
+        if (special.len > 0) {
+            @memcpy(buf[0..special.len], special);
+            return special.len;
+        }
+
+        const n = xkb_state_key_get_utf8(self.state, keycode, buf.ptr, buf.len);
         if (n > 0) return @intCast(n);
 
         return 0;
     }
 };
+
+// ── X11 layout query (reads _XKB_RULES_NAMES from root window) ─────
+
+// XCB externs for property query (already linked via libxcb)
+const xcb_connection_t = opaque {};
+const XcbCookie = extern struct { sequence: c_uint };
+
+const XcbAtomReply = extern struct {
+    response_type: u8, pad0: u8, sequence: u16, length: u32, atom: u32,
+};
+
+const XcbPropertyReply = extern struct {
+    response_type: u8, format: u8, sequence: u16, length: u32,
+    type_: u32, bytes_after: u32, value_len: u32, pad0: [12]u8,
+};
+
+extern "xcb" fn xcb_intern_atom(conn: *xcb_connection_t, only_if_exists: u8, name_len: u16, name: [*]const u8) callconv(.c) XcbCookie;
+extern "xcb" fn xcb_intern_atom_reply(conn: *xcb_connection_t, cookie: XcbCookie, err: ?*?*anyopaque) callconv(.c) ?*XcbAtomReply;
+extern "xcb" fn xcb_get_property(conn: *xcb_connection_t, delete: u8, window: u32, property: u32, type_: u32, long_offset: u32, long_length: u32) callconv(.c) XcbCookie;
+extern "xcb" fn xcb_get_property_reply(conn: *xcb_connection_t, cookie: XcbCookie, err: ?*?*anyopaque) callconv(.c) ?*XcbPropertyReply;
+extern "xcb" fn xcb_get_property_value(reply: *XcbPropertyReply) callconv(.c) ?[*]const u8;
+extern "xcb" fn xcb_get_property_value_length(reply: *XcbPropertyReply) callconv(.c) c_int;
+
+const XCB_ATOM_STRING: u32 = 31;
+
+/// Query _XKB_RULES_NAMES property from the X11 root window.
+/// Returns RMLVO names parsed from the null-separated value.
+/// This property is set by setxkbmap and reflects the LIVE keyboard layout.
+fn queryX11Layout(conn_opaque: *anyopaque, root: u32, buf: []u8) ?XkbRuleNames {
+    const conn: *xcb_connection_t = @ptrCast(conn_opaque);
+
+    // Intern _XKB_RULES_NAMES atom
+    const atom_name = "_XKB_RULES_NAMES";
+    const cookie = xcb_intern_atom(conn, 1, atom_name.len, atom_name.ptr);
+    const reply = xcb_intern_atom_reply(conn, cookie, null) orelse return null;
+    const atom = reply.atom;
+    std.c.free(@ptrCast(@constCast(reply)));
+    if (atom == 0) return null;
+
+    // Get property value
+    const prop_cookie = xcb_get_property(conn, 0, root, atom, XCB_ATOM_STRING, 0, 1024);
+    const prop_reply = xcb_get_property_reply(conn, prop_cookie, null) orelse return null;
+    defer std.c.free(@ptrCast(@constCast(prop_reply)));
+
+    const value_ptr = xcb_get_property_value(prop_reply) orelse return null;
+    const value_len: usize = @intCast(xcb_get_property_value_length(prop_reply));
+    if (value_len == 0 or value_len > buf.len) return null;
+
+    // Copy to our buffer (the reply will be freed)
+    @memcpy(buf[0..value_len], value_ptr[0..value_len]);
+
+    // _XKB_RULES_NAMES is 5 null-terminated strings:
+    // rules\0model\0layout\0variant\0options\0
+    var names = XkbRuleNames{};
+    var field: u8 = 0;
+    var start: usize = 0;
+    for (0..value_len) |i| {
+        if (buf[i] == 0) {
+            if (i > start) {
+                // Null-terminate in buf (already is, from the property)
+                const str: [*:0]const u8 = @ptrCast(buf[start..].ptr);
+                switch (field) {
+                    0 => names.rules = str,
+                    1 => names.model = str,
+                    2 => names.layout = str,
+                    3 => names.variant = str,
+                    4 => names.options = str,
+                    else => {},
+                }
+            }
+            field += 1;
+            start = i + 1;
+        }
+    }
+
+    return names;
+}
 
 fn keysymToEscape(keysym: u32) []const u8 {
     return switch (keysym) {

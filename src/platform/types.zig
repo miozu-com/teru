@@ -32,3 +32,6 @@ pub const Event = union(enum) {
 };
 
 pub const Size = struct { width: u32, height: u32 };
+
+/// X11 connection info for keyboard layout query.
+pub const X11Info = struct { conn: *anyopaque, root: u32 };

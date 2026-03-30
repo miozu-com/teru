@@ -358,6 +358,11 @@ pub const X11Window = struct {
     pub fn getSize(self: *const X11Window) platform.Size {
         return .{ .width = self.width, .height = self.height };
     }
+
+    /// Get XCB connection and root window for keyboard layout query.
+    pub fn getX11Info(self: *const X11Window) platform.X11Info {
+        return .{ .conn = @ptrCast(self.connection), .root = self.screen.root };
+    }
 };
 
 /// Map XCB button detail (1-5) to MouseButton.

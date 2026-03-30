@@ -114,10 +114,17 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     hooks.fire(.spawn);
 
     // Keyboard input: xkbcommon translates XCB keycodes → UTF-8
-    var keyboard = if (Keyboard != void)
-        Keyboard.init() catch null
-    else
-        null;
+    // Uses the LIVE X11 keymap (supports dvorak, colemak, any layout)
+    var keyboard = if (Keyboard != void) blk: {
+        // Try to get X11 connection info for layout query
+        const x11_info = win.getX11Info();
+        if (x11_info) |info| {
+            break :blk Keyboard.initFromX11(info.conn, info.root) catch
+                Keyboard.init() catch null;
+        } else {
+            break :blk Keyboard.init() catch null;
+        }
+    } else null;
     defer if (Keyboard != void) {
         if (keyboard) |*kb| kb.deinit();
     };
