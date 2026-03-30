@@ -90,8 +90,8 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     renderer.updateAtlas(atlas.atlas_data, atlas.atlas_width, atlas.atlas_height);
 
     const padding: u32 = 4; // must match SoftwareRenderer.padding
-    const grid_cols: u16 = @intCast((config.initial_width -| padding * 2) / atlas.cell_width);
-    const grid_rows: u16 = @intCast((config.initial_height -| padding * 2) / atlas.cell_height);
+    var grid_cols: u16 = @intCast((config.initial_width -| padding * 2) / atlas.cell_width);
+    var grid_rows: u16 = @intCast((config.initial_height -| padding * 2) / atlas.cell_height);
 
     // Multiplexer: manages all panes (linked to process graph for agent rendering)
     var mux = Multiplexer.init(allocator);
@@ -138,10 +138,14 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Do an early PTY read to catch shell startup queries (DA1, DSR)
-    // before entering the event loop. Prevents fish 2-second timeout.
+    // Early PTY reads to catch shell startup queries (DA1, DSR, XTGETTCAP).
+    // Fish sends DA1 immediately on startup — we need to respond before
+    // its 2-second timeout. Do several reads with small delays to catch it.
     if (mux.getActivePane()) |pane| {
-        _ = pane.readAndProcess(&pty_buf) catch {};
+        for (0..10) |_| {
+            _ = pane.readAndProcess(&pty_buf) catch {};
+            io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
     }
 
     while (running) {
@@ -162,9 +166,11 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                     // Resize renderer
                     renderer.resize(sz.width, sz.height);
 
-                    // Recalculate grid dimensions for each pane
-                    const new_cols: u16 = @intCast(sz.width / atlas.cell_width);
-                    const new_rows: u16 = @intCast(sz.height / atlas.cell_height);
+                    // Recalculate grid dimensions
+                    const new_cols: u16 = @intCast((sz.width -| padding * 2) / atlas.cell_width);
+                    const new_rows: u16 = @intCast((sz.height -| padding * 2) / atlas.cell_height);
+                    grid_cols = new_cols;
+                    grid_rows = new_rows;
 
                     // Resize all panes in the active workspace
                     // In multi-pane mode, panes share the screen — each gets
