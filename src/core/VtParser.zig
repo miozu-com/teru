@@ -525,6 +525,10 @@ fn finishOsc(self: *VtParser) void {
                 // Clipboard (OSC 52). Format: "c;BASE64" or "c;?" for query.
                 // Silently accepted — clipboard integration requires platform support.
             },
+            133 => {
+                // Shell integration: semantic prompt marks (A/B/C/D)
+                self.handleOsc133(payload);
+            },
             9999 => {
                 // Agent protocol — store payload for external consumption
                 if (payload.len <= self.agent_event_buf.len) {
@@ -535,6 +539,41 @@ fn finishOsc(self: *VtParser) void {
             },
             else => {},
         }
+    }
+}
+
+/// Handle OSC 133 shell integration (semantic prompt marks).
+/// Payload format: "A", "B", "C", "D", or "D;exit_code".
+fn handleOsc133(self: *VtParser, payload: []const u8) void {
+    if (payload.len == 0) return;
+
+    const grid = self.grid;
+    const row = grid.cursor_row;
+    if (row >= grid.row_meta.len) return;
+
+    switch (payload[0]) {
+        'A' => {
+            grid.row_meta[row].prompt_mark = .prompt_start;
+        },
+        'B' => {
+            grid.row_meta[row].prompt_mark = .input_start;
+        },
+        'C' => {
+            grid.row_meta[row].prompt_mark = .output_start;
+        },
+        'D' => {
+            grid.row_meta[row].prompt_mark = .output_end;
+            // Parse exit code: "D;0" or "D;1" etc.
+            if (payload.len >= 3 and payload[1] == ';') {
+                // Find end of number (could have ";aid=PID" suffix)
+                var end: usize = 2;
+                while (end < payload.len and payload[end] >= '0' and payload[end] <= '9') : (end += 1) {}
+                grid.row_meta[row].exit_code = std.fmt.parseInt(u8, payload[2..end], 10) catch null;
+            } else {
+                grid.row_meta[row].exit_code = null;
+            }
+        },
+        else => {},
     }
 }
 
@@ -1722,4 +1761,80 @@ test "OSC 0 sets title and title_changed flag" {
     parser.feed("\x1b]0;new title\x07");
     try std.testing.expect(parser.title_changed);
     try std.testing.expectEqualSlices(u8, "new title", parser.title[0..parser.title_len]);
+}
+
+test "OSC 133 A/B/C/D parsing" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // A mark (prompt start)
+    parser.feed("\x1b]133;A\x07");
+    try std.testing.expectEqual(Grid.PromptMark.prompt_start, grid.row_meta[0].prompt_mark);
+
+    // Move cursor down
+    grid.cursor_row = 1;
+    parser.feed("\x1b]133;B\x07");
+    try std.testing.expectEqual(Grid.PromptMark.input_start, grid.row_meta[1].prompt_mark);
+
+    grid.cursor_row = 2;
+    parser.feed("\x1b]133;C\x07");
+    try std.testing.expectEqual(Grid.PromptMark.output_start, grid.row_meta[2].prompt_mark);
+
+    grid.cursor_row = 5;
+    parser.feed("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(Grid.PromptMark.output_end, grid.row_meta[5].prompt_mark);
+    try std.testing.expectEqual(@as(?u8, 0), grid.row_meta[5].exit_code);
+}
+
+test "OSC 133 D exit code extraction" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // Exit code 0 (success)
+    grid.cursor_row = 0;
+    parser.feed("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(@as(?u8, 0), grid.row_meta[0].exit_code);
+
+    // Exit code 1 (failure)
+    grid.cursor_row = 1;
+    parser.feed("\x1b]133;D;1\x07");
+    try std.testing.expectEqual(@as(?u8, 1), grid.row_meta[1].exit_code);
+
+    // Exit code 127
+    grid.cursor_row = 2;
+    parser.feed("\x1b]133;D;127\x07");
+    try std.testing.expectEqual(@as(?u8, 127), grid.row_meta[2].exit_code);
+
+    // D without exit code
+    grid.cursor_row = 3;
+    parser.feed("\x1b]133;D\x07");
+    try std.testing.expectEqual(Grid.PromptMark.output_end, grid.row_meta[3].prompt_mark);
+    try std.testing.expectEqual(@as(?u8, null), grid.row_meta[3].exit_code);
+
+    // D with aid= suffix: "D;0;aid=12345"
+    grid.cursor_row = 4;
+    parser.feed("\x1b]133;D;0;aid=12345\x07");
+    try std.testing.expectEqual(@as(?u8, 0), grid.row_meta[4].exit_code);
+}
+
+test "OSC 133 marks do not interfere with text" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // Interleave text with OSC 133 marks
+    parser.feed("$ ");
+    parser.feed("\x1b]133;A\x07");
+    parser.feed("ls");
+
+    try std.testing.expectEqual(@as(u21, '$'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 's'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(Grid.PromptMark.prompt_start, grid.row_meta[0].prompt_mark);
 }

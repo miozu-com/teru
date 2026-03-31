@@ -1,8 +1,11 @@
 const std = @import("std");
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Pane = @import("Pane.zig");
 const Grid = @import("Grid.zig");
+const VtParser = @import("VtParser.zig");
+const Pty = @import("../pty/Pty.zig");
 const LayoutEngine = @import("../tiling/LayoutEngine.zig");
 const Rect = LayoutEngine.Rect;
 const Selection = @import("Selection.zig");
@@ -54,6 +57,44 @@ pub fn spawnPane(self: *Multiplexer, rows: u16, cols: u16) !u64 {
 
     var pane = try Pane.init(self.allocator, rows, cols, id);
     errdefer pane.deinit(self.allocator);
+
+    try self.panes.append(self.allocator, pane);
+    errdefer _ = self.panes.pop();
+
+    // Patch VtParser's grid pointer now that Pane is in its final memory location
+    self.panes.items[self.panes.items.len - 1].linkVt(self.allocator);
+
+    try self.layout_engine.workspaces[self.active_workspace].addNode(self.allocator, id);
+
+    return id;
+}
+
+/// Spawn a pane running a custom command instead of the user's shell.
+/// The command string is passed as the shell argument to Pty.spawn.
+/// Returns the pane ID.
+pub fn spawnPaneWithCommand(self: *Multiplexer, rows: u16, cols: u16, command: []const u8, cwd: ?[]const u8) !u64 {
+    const id = self.next_pane_id;
+    self.next_pane_id += 1;
+
+    var grid = try Grid.init(self.allocator, rows, cols);
+    errdefer grid.deinit(self.allocator);
+
+    var pty = try Pty.spawn(.{ .rows = rows, .cols = cols, .shell = command, .cwd = cwd });
+    errdefer pty.deinit();
+
+    // Set PTY master to non-blocking
+    const flags = std.c.fcntl(pty.master, posix.F.GETFL);
+    if (flags < 0) return error.FcntlFailed;
+    const O_NONBLOCK = 0x800;
+    _ = std.c.fcntl(pty.master, posix.F.SETFL, flags | O_NONBLOCK);
+
+    var pane = Pane{
+        .pty = pty,
+        .grid = grid,
+        .vt = VtParser.initEmpty(),
+        .id = id,
+    };
+    _ = &pane;
 
     try self.panes.append(self.allocator, pane);
     errdefer _ = self.panes.pop();

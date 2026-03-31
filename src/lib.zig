@@ -17,6 +17,7 @@ pub const ProcessGraph = @import("graph/ProcessGraph.zig");
 pub const protocol = @import("agent/protocol.zig");
 pub const HookHandler = @import("agent/HookHandler.zig");
 pub const McpServer = @import("agent/McpServer.zig");
+pub const PaneBackend = @import("agent/PaneBackend.zig");
 pub const Terminal = @import("core/Terminal.zig");
 pub const Grid = @import("core/Grid.zig");
 pub const VtParser = @import("core/VtParser.zig");
@@ -40,6 +41,7 @@ test {
     _ = protocol;
     _ = HookHandler;
     _ = McpServer;
+    _ = PaneBackend;
     _ = Terminal;
     _ = Grid;
     _ = VtParser;

@@ -9,6 +9,7 @@ const platform = @import("platform/platform.zig");
 const render = @import("render/render.zig");
 const protocol = @import("agent/protocol.zig");
 const McpServer = @import("agent/McpServer.zig");
+const PaneBackend = @import("agent/PaneBackend.zig");
 const build_options = @import("build_options");
 const Config = @import("config/Config.zig");
 const Hooks = @import("config/Hooks.zig");
@@ -24,6 +25,8 @@ else
 
 const Session = @import("persist/Session.zig");
 const UrlDetector = @import("core/UrlDetector.zig");
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const version = "0.2.0";
 
@@ -141,6 +144,18 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io, restore: ?RestoreIn
     // MCP server: exposes pane/graph state to Claude Code over Unix socket
     var mcp = McpServer.init(allocator, &mux, &graph) catch null;
     defer if (mcp) |*m| m.deinit();
+
+    // PaneBackend: Claude Code agent team protocol (NDJSON over Unix socket)
+    var pane_backend = PaneBackend.init(allocator, &mux, &graph) catch null;
+    defer if (pane_backend) |*pb| pb.deinit();
+
+    // Set env var so Claude Code instances know about the pane backend
+    if (pane_backend) |*pb| {
+        const path = pb.getSocketPath();
+        var env_buf: [128:0]u8 = [_:0]u8{0} ** 128;
+        @memcpy(env_buf[0..path.len], path);
+        _ = setenv("CLAUDE_PANE_BACKEND_SOCKET", &env_buf, 1);
+    }
 
     // Spawn panes (restore or fresh)
     const pane_count: u16 = if (restore) |r| r.pane_count else 1;
@@ -519,6 +534,12 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io, restore: ?RestoreIn
 
         // Poll MCP server for incoming connections
         if (mcp) |*m| m.poll();
+
+        // Poll PaneBackend for Claude Code agent team protocol
+        if (pane_backend) |*pb| {
+            pb.poll();
+            pb.checkExits();
+        }
 
         // Check for agent protocol events on all panes
         for (mux.panes.items) |*pane| {

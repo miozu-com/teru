@@ -36,6 +36,21 @@ pub const Cell = struct {
 
 pub const CursorShape = enum { block, underline, bar };
 
+/// OSC 133 shell integration: semantic prompt marks.
+pub const PromptMark = enum {
+    none,
+    prompt_start, // A: shell is drawing prompt
+    input_start, // B: user is typing
+    output_start, // C: command executing, output begins
+    output_end, // D: command finished
+};
+
+/// Per-row metadata for shell integration (OSC 133).
+pub const RowMeta = struct {
+    prompt_mark: PromptMark = .none,
+    exit_code: ?u8 = null, // set on D mark
+};
+
 cells: []Cell,
 rows: u16,
 cols: u16,
@@ -67,21 +82,31 @@ alt_cells: ?[]Cell = null,
 alt_saved_cursor_row: u16 = 0,
 alt_saved_cursor_col: u16 = 0,
 
+/// Per-row metadata for OSC 133 shell integration.
+/// Allocated alongside cells, one entry per row.
+row_meta: []RowMeta = &.{},
+
 pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Grid {
     const total = @as(usize, rows) * @as(usize, cols);
     const cells = try allocator.alloc(Cell, total);
     for (cells) |*c| c.* = Cell.blank();
+
+    const meta = try allocator.alloc(RowMeta, rows);
+    for (meta) |*m| m.* = .{};
 
     return .{
         .cells = cells,
         .rows = rows,
         .cols = cols,
         .scroll_bottom = rows -| 1,
+        .row_meta = meta,
     };
 }
 
 pub fn deinit(self: *Grid, allocator: std.mem.Allocator) void {
     allocator.free(self.cells);
+    if (self.row_meta.len > 0) allocator.free(self.row_meta);
+    self.row_meta = &.{};
     if (self.alt_cells) |alt| {
         allocator.free(alt);
         self.alt_cells = null;
@@ -177,6 +202,14 @@ pub fn scrollUpN(self: *Grid, n: u16) void {
             const src_start = (row + 1) * w;
             @memcpy(self.cells[dst_start..][0..w], self.cells[src_start..][0..w]);
         }
+        // Shift row_meta up within the scroll region
+        if (self.row_meta.len > bottom) {
+            var mr = top;
+            while (mr < bottom) : (mr += 1) {
+                self.row_meta[mr] = self.row_meta[mr + 1];
+            }
+            self.row_meta[bottom] = .{};
+        }
         // Clear the bottom row of the scroll region
         self.clearRow(@intCast(bottom));
     }
@@ -202,6 +235,14 @@ pub fn scrollDownN(self: *Grid, n: u16) void {
             const dst_start = row * w;
             const src_start = (row - 1) * w;
             @memcpy(self.cells[dst_start..][0..w], self.cells[src_start..][0..w]);
+        }
+        // Shift row_meta down within the scroll region
+        if (self.row_meta.len > bottom) {
+            var mr = bottom;
+            while (mr > top) : (mr -= 1) {
+                self.row_meta[mr] = self.row_meta[mr - 1];
+            }
+            self.row_meta[top] = .{};
         }
         // Clear the top row of the scroll region
         self.clearRow(@intCast(top));
@@ -289,6 +330,17 @@ pub fn resize(self: *Grid, allocator: std.mem.Allocator, new_rows: u16, new_cols
 
     allocator.free(self.cells);
     self.cells = new_cells;
+
+    // Resize row_meta, preserving existing marks
+    const new_meta = try allocator.alloc(RowMeta, new_rows);
+    for (new_meta) |*m| m.* = .{};
+    const copy_meta = @min(self.row_meta.len, @as(usize, new_rows));
+    if (copy_meta > 0) {
+        @memcpy(new_meta[0..copy_meta], self.row_meta[0..copy_meta]);
+    }
+    if (self.row_meta.len > 0) allocator.free(self.row_meta);
+    self.row_meta = new_meta;
+
     self.rows = new_rows;
     self.cols = new_cols;
     self.scroll_bottom = new_rows -| 1;
@@ -904,4 +956,81 @@ test "switchToAltScreen and switchToMainScreen" {
     // Main cursor should be restored
     try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
     try std.testing.expectEqual(@as(u16, 3), grid.cursor_col);
+}
+
+test "row_meta initialized to none" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 5, 10);
+    defer grid.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), grid.row_meta.len);
+    for (grid.row_meta) |meta| {
+        try std.testing.expectEqual(PromptMark.none, meta.prompt_mark);
+        try std.testing.expectEqual(@as(?u8, null), meta.exit_code);
+    }
+}
+
+test "row_meta scrolls with content" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+
+    // Set prompt marks
+    grid.row_meta[0].prompt_mark = .prompt_start;
+    grid.row_meta[1].prompt_mark = .output_start;
+    grid.row_meta[2].prompt_mark = .output_end;
+    grid.row_meta[2].exit_code = 0;
+
+    // Scroll up: row 0 lost, rows shift up, new bottom row cleared
+    grid.scrollUp();
+
+    try std.testing.expectEqual(PromptMark.output_start, grid.row_meta[0].prompt_mark);
+    try std.testing.expectEqual(PromptMark.output_end, grid.row_meta[1].prompt_mark);
+    try std.testing.expectEqual(@as(?u8, 0), grid.row_meta[1].exit_code);
+    try std.testing.expectEqual(PromptMark.none, grid.row_meta[2].prompt_mark);
+    try std.testing.expectEqual(@as(?u8, null), grid.row_meta[2].exit_code);
+}
+
+test "row_meta preserved on resize" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 10);
+    defer grid.deinit(allocator);
+
+    grid.row_meta[0].prompt_mark = .prompt_start;
+    grid.row_meta[1].prompt_mark = .input_start;
+    grid.row_meta[2].prompt_mark = .output_start;
+    grid.row_meta[3].prompt_mark = .output_end;
+    grid.row_meta[3].exit_code = 1;
+
+    // Grow: marks preserved
+    try grid.resize(allocator, 6, 10);
+    try std.testing.expectEqual(@as(usize, 6), grid.row_meta.len);
+    try std.testing.expectEqual(PromptMark.prompt_start, grid.row_meta[0].prompt_mark);
+    try std.testing.expectEqual(PromptMark.output_end, grid.row_meta[3].prompt_mark);
+    try std.testing.expectEqual(@as(?u8, 1), grid.row_meta[3].exit_code);
+    try std.testing.expectEqual(PromptMark.none, grid.row_meta[5].prompt_mark);
+
+    // Shrink: only first 3 rows survive
+    try grid.resize(allocator, 3, 10);
+    try std.testing.expectEqual(@as(usize, 3), grid.row_meta.len);
+    try std.testing.expectEqual(PromptMark.prompt_start, grid.row_meta[0].prompt_mark);
+    try std.testing.expectEqual(PromptMark.output_start, grid.row_meta[2].prompt_mark);
+}
+
+test "scrollDown shifts row_meta down" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+
+    grid.row_meta[0].prompt_mark = .prompt_start;
+    grid.row_meta[1].prompt_mark = .output_start;
+    grid.row_meta[2].prompt_mark = .output_end;
+
+    grid.scrollDown();
+
+    // Row 0 should be cleared (new blank line at top)
+    try std.testing.expectEqual(PromptMark.none, grid.row_meta[0].prompt_mark);
+    // Old rows shift down
+    try std.testing.expectEqual(PromptMark.prompt_start, grid.row_meta[1].prompt_mark);
+    try std.testing.expectEqual(PromptMark.output_start, grid.row_meta[2].prompt_mark);
 }
