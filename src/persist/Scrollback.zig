@@ -210,6 +210,20 @@ pub fn getRange(self: *const Scrollback, start: u64, end: u64, grid: *Grid, vt_p
     }
 }
 
+/// Get the text of a scrollback line by its index from the end.
+/// offset=0 returns the most recent line, offset=1 the one before, etc.
+/// Returns null if the offset is out of range.
+pub fn getLineByOffset(self: *const Scrollback, offset: usize) ?[]const u8 {
+    if (offset >= self.deltas.items.len) return null;
+    const idx = self.deltas.items.len - 1 - offset;
+    return self.deltas.items[idx].vt_bytes;
+}
+
+/// Return the number of available scrollback lines (after trimming).
+pub fn lineCount(self: *const Scrollback) usize {
+    return self.deltas.items.len;
+}
+
 // ── Stats ───────────────────────────────────────────────────────
 
 /// Returns the compression ratio: equivalent_expanded / actual_stored.
@@ -554,7 +568,7 @@ test "push and retrieve single line" {
 
     // Write "Hello" into grid, then push the VT bytes
     const vt_bytes = "Hello\r\n";
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
     parser.feed(vt_bytes);
 
     // Simulate the line scrolling off (push line 0)
@@ -566,7 +580,7 @@ test "push and retrieve single line" {
     // Retrieve line 0 into a fresh grid
     var restore_grid = try Grid.init(allocator, 24, 80);
     defer restore_grid.deinit(allocator);
-    var restore_parser = VtParser.init(&restore_grid);
+    var restore_parser = VtParser.init(allocator, &restore_grid);
 
     try sb.getLine(0, &restore_grid, &restore_parser);
     // After the keyframe (line 0), no deltas are replayed (delta 0 has the
@@ -684,7 +698,7 @@ test "random access within keyframe range" {
     // Access line 150 — should use keyframe at 100 and replay 50 deltas
     var restore_grid = try Grid.init(allocator, 4, 20);
     defer restore_grid.deinit(allocator);
-    var restore_parser = VtParser.init(&restore_grid);
+    var restore_parser = VtParser.init(allocator, &restore_grid);
 
     try sb.getLine(150, &restore_grid, &restore_parser);
     // The line was replayed through VT, so the grid should have content
@@ -779,7 +793,7 @@ test "range retrieval" {
     // Retrieve range [100, 110) — should use keyframe at 100
     var restore_grid = try Grid.init(allocator, 4, 20);
     defer restore_grid.deinit(allocator);
-    var restore_parser = VtParser.init(&restore_grid);
+    var restore_parser = VtParser.init(allocator, &restore_grid);
 
     try sb.getRange(100, 110, &restore_grid, &restore_parser);
 
@@ -873,7 +887,7 @@ test "line out of range returns error" {
 
     var restore_grid = try Grid.init(allocator, 4, 10);
     defer restore_grid.deinit(allocator);
-    var restore_parser = VtParser.init(&restore_grid);
+    var restore_parser = VtParser.init(allocator, &restore_grid);
 
     try std.testing.expectError(error.LineOutOfRange, sb.getLine(5, &restore_grid, &restore_parser));
 }
@@ -897,4 +911,43 @@ test "max_bytes limit triggers trimming" {
 
     // Should have trimmed to stay under budget
     try std.testing.expect(sb.total_bytes_stored <= 500 + 100); // some slack for last push
+}
+
+test "getLineByOffset returns lines from end" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 10);
+    defer grid.deinit(allocator);
+
+    var sb = Scrollback.init(allocator, .{ .keyframe_interval = 100 });
+    defer sb.deinit();
+
+    try sb.pushLine("first", &grid);
+    try sb.pushLine("second", &grid);
+    try sb.pushLine("third", &grid);
+
+    try std.testing.expectEqual(@as(usize, 3), sb.lineCount());
+
+    // offset=0 is most recent
+    try std.testing.expectEqualStrings("third", sb.getLineByOffset(0).?);
+    try std.testing.expectEqualStrings("second", sb.getLineByOffset(1).?);
+    try std.testing.expectEqualStrings("first", sb.getLineByOffset(2).?);
+
+    // Out of range returns null
+    try std.testing.expectEqual(@as(?[]const u8, null), sb.getLineByOffset(3));
+}
+
+test "lineCount matches delta count" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 10);
+    defer grid.deinit(allocator);
+
+    var sb = Scrollback.init(allocator, .{ .keyframe_interval = 100 });
+    defer sb.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), sb.lineCount());
+
+    for (0..10) |_| {
+        try sb.pushLine("test", &grid);
+    }
+    try std.testing.expectEqual(@as(usize, 10), sb.lineCount());
 }

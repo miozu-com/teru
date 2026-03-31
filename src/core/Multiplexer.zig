@@ -59,7 +59,7 @@ pub fn spawnPane(self: *Multiplexer, rows: u16, cols: u16) !u64 {
     errdefer _ = self.panes.pop();
 
     // Patch VtParser's grid pointer now that Pane is in its final memory location
-    self.panes.items[self.panes.items.len - 1].linkVt();
+    self.panes.items[self.panes.items.len - 1].linkVt(self.allocator);
 
     try self.layout_engine.workspaces[self.active_workspace].addNode(self.allocator, id);
 

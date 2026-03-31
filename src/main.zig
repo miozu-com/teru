@@ -15,6 +15,8 @@ const Hooks = @import("config/Hooks.zig");
 const Selection = @import("core/Selection.zig");
 const Clipboard = @import("core/Clipboard.zig");
 const KeyHandler = @import("core/KeyHandler.zig");
+const Grid = @import("core/Grid.zig");
+const Scrollback = @import("persist/Scrollback.zig");
 const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
     @import("platform/linux/keyboard.zig").Keyboard
 else
@@ -47,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--help")) {
-            out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\n");
+            out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\nScrollback:\n  Shift+PageUp    Scroll up one page\n  Shift+PageDown  Scroll down one page\n  Any key         Exit scroll mode\n\n");
             return;
         }
         if (std.mem.eql(u8, arg, "--raw")) {
@@ -142,19 +144,10 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var pty_buf: [8192]u8 = undefined;
     var running = true;
 
-    // Initial PTY read — process first batch of shell output.
-    // Responses are disabled during startup to prevent echo-back
-    // (shell re-enables ECHO on init, causing our DA1 response
-    // to be echoed as typed text).
-    if (mux.getActivePane()) |pane| {
-        _ = pane.readAndProcess(&pty_buf) catch {};
-    }
-
-    // Enable VT responses now that the shell has initialized.
-    // From here on, DA1/DSR queries will be answered correctly.
-    for (mux.panes.items) |*pane| {
-        pane.vt.responses_enabled = true;
-    }
+    // Scrollback browsing state
+    var scroll_offset: u32 = 0;
+    var saved_cells: ?[]Grid.Cell = null;
+    defer if (saved_cells) |sc| allocator.free(sc);
 
     while (running) {
         // Check prefix timeout
@@ -189,10 +182,69 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                             pane.resize(allocator, new_rows, new_cols) catch continue;
                         }
                     }
+
+                    // Exit scroll mode on resize — grid dimensions changed,
+                    // saved_cells is stale. PTY output will refresh the grid.
+                    if (scroll_offset > 0) {
+                        scroll_offset = 0;
+                        if (saved_cells) |sc| {
+                            allocator.free(sc);
+                            saved_cells = null;
+                        }
+                    }
                 },
                 .key_press => |key| {
+                    const XKB_KEY_Page_Up: u32 = 0xff55;
+                    const XKB_KEY_Page_Down: u32 = 0xff56;
+                    const SHIFT_MASK: u32 = 1; // XCB ShiftMask
+
                     if (Keyboard != void) {
                         if (keyboard) |*kb| {
+                            // Peek keysym before processKey updates state
+                            const keysym = kb.getKeysym(key.keycode);
+
+                            // Shift+PageUp/Down: scrollback browsing
+                            if (key.modifiers & SHIFT_MASK != 0) {
+                                if (keysym == XKB_KEY_Page_Up) {
+                                    const max_offset = if (mux.getActivePane()) |pane|
+                                        if (pane.grid.scrollback) |sb| @as(u32, @intCast(sb.lineCount())) else 0
+                                    else
+                                        0;
+                                    if (max_offset > 0) {
+                                        scroll_offset = @min(scroll_offset + grid_rows, max_offset);
+                                        if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                    }
+                                    // Update xkb state without forwarding to PTY
+                                    var dummy: [32]u8 = undefined;
+                                    _ = kb.processKey(key.keycode, true, &dummy);
+                                    continue;
+                                } else if (keysym == XKB_KEY_Page_Down) {
+                                    if (scroll_offset > 0) {
+                                        scroll_offset -|= grid_rows;
+                                        if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                    }
+                                    var dummy: [32]u8 = undefined;
+                                    _ = kb.processKey(key.keycode, true, &dummy);
+                                    continue;
+                                }
+                            }
+
+                            // Any other key while in scroll mode: exit scroll mode
+                            if (scroll_offset > 0) {
+                                scroll_offset = 0;
+                                // Restore saved cells
+                                if (saved_cells) |sc| {
+                                    if (mux.getActivePane()) |pane| {
+                                        if (sc.len == pane.grid.cells.len) {
+                                            @memcpy(pane.grid.cells, sc);
+                                        }
+                                        pane.grid.dirty = true;
+                                    }
+                                    allocator.free(sc);
+                                    saved_cells = null;
+                                }
+                            }
+
                             var key_buf: [32]u8 = undefined;
                             const len = kb.processKey(key.keycode, true, &key_buf);
 
@@ -220,6 +272,19 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                         }
                     } else {
                         // Fallback: raw keycode passthrough (no xkbcommon)
+                        if (scroll_offset > 0) {
+                            scroll_offset = 0;
+                            if (saved_cells) |sc| {
+                                if (mux.getActivePane()) |pane| {
+                                    if (sc.len == pane.grid.cells.len) {
+                                        @memcpy(pane.grid.cells, sc);
+                                    }
+                                    pane.grid.dirty = true;
+                                }
+                                allocator.free(sc);
+                                saved_cells = null;
+                            }
+                        }
                         if (prefix.awaiting) {
                             prefix.reset();
                             if (key.keycode < 128) {
@@ -381,6 +446,20 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
         }
 
         if (any_dirty) {
+            // Scrollback overlay: temporarily replace grid cells with scrollback text
+            if (scroll_offset > 0) {
+                if (mux.getActivePane()) |pane| {
+                    if (pane.grid.scrollback) |sb| {
+                        // Save original cells on first entry
+                        if (saved_cells == null) {
+                            saved_cells = allocator.dupe(Grid.Cell, pane.grid.cells) catch null;
+                        }
+                        // Fill grid with scrollback content
+                        fillGridWithScrollback(&pane.grid, sb, scroll_offset);
+                    }
+                }
+            }
+
             // Get the underlying SoftwareRenderer for multi-pane rendering
             switch (renderer) {
                 .cpu => |*cpu| {
@@ -398,6 +477,71 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
         } else {
             // 1ms idle sleep via native Io.sleep
             io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+}
+
+/// Fill the grid with scrollback text for browsing mode.
+/// scroll_offset is the number of lines from the bottom of scrollback.
+/// The last row shows a "[SCROLL +N]" indicator.
+fn fillGridWithScrollback(grid: *Grid, sb: *const Scrollback, scroll_offset: u32) void {
+    const rows = grid.rows;
+    const cols = grid.cols;
+
+    // Clear entire grid
+    for (grid.cells) |*c| c.* = Grid.Cell.blank();
+
+    // Reserve last row for scroll indicator
+    const content_rows: u16 = if (rows > 1) rows - 1 else rows;
+
+    // scroll_offset=1 means show the most recent scrollback line at the bottom.
+    // We want to show lines [offset - content_rows, offset) from the end,
+    // where offset 0 is the most recent line.
+    // Line at offset (scroll_offset - 1) is the bottom content line.
+    // Line at offset (scroll_offset - 1 + content_rows - 1) is the top content line.
+
+    var row: u16 = 0;
+    while (row < content_rows) : (row += 1) {
+        // Which scrollback line to show on this grid row?
+        // Top row = furthest back, bottom row = most recent in this view
+        const lines_from_bottom = scroll_offset -| 1 + (content_rows - 1 - row);
+        const text = sb.getLineByOffset(lines_from_bottom) orelse continue;
+
+        // Write text into grid row
+        var col: u16 = 0;
+        for (text) |byte| {
+            if (col >= cols) break;
+            grid.cellAt(row, col).char = byte;
+            grid.cellAt(row, col).fg = .default;
+            col += 1;
+        }
+    }
+
+    // Draw scroll indicator on the last row
+    if (rows > 0) {
+        const indicator_row = rows - 1;
+        var buf: [64]u8 = undefined;
+        const indicator = std.fmt.bufPrint(&buf, "[SCROLL +{d}]", .{scroll_offset}) catch "[SCROLL]";
+
+        var col: u16 = 0;
+        for (indicator) |byte| {
+            if (col >= cols) break;
+            const cell = grid.cellAt(indicator_row, col);
+            cell.char = byte;
+            cell.fg = .{ .indexed = 208 }; // orange
+            cell.attrs.bold = true;
+            col += 1;
+        }
+
+        // Show total lines available
+        const total = sb.lineCount();
+        const info = std.fmt.bufPrint(buf[indicator.len..], " ({d} lines)", .{total}) catch "";
+        for (info) |byte| {
+            if (col >= cols) break;
+            const cell = grid.cellAt(indicator_row, col);
+            cell.char = byte;
+            cell.fg = .{ .indexed = 245 }; // gray
+            col += 1;
         }
     }
 }

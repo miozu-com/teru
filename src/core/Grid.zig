@@ -56,6 +56,13 @@ pen_attrs: Attrs = .{},
 saved_cursor_row: u16 = 0,
 saved_cursor_col: u16 = 0,
 
+/// Alt screen buffer. When non-null, this holds the INACTIVE screen's cells.
+/// On alt-screen switch, `cells` and `alt_cells` are swapped.
+alt_cells: ?[]Cell = null,
+/// Cursor position saved for the alt screen's paired main screen.
+alt_saved_cursor_row: u16 = 0,
+alt_saved_cursor_col: u16 = 0,
+
 pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Grid {
     const total = @as(usize, rows) * @as(usize, cols);
     const cells = try allocator.alloc(Cell, total);
@@ -71,6 +78,10 @@ pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Grid {
 
 pub fn deinit(self: *Grid, allocator: std.mem.Allocator) void {
     allocator.free(self.cells);
+    if (self.alt_cells) |alt| {
+        allocator.free(alt);
+        self.alt_cells = null;
+    }
     self.cells = &.{};
 }
 
@@ -279,6 +290,16 @@ pub fn resize(self: *Grid, allocator: std.mem.Allocator, new_rows: u16, new_cols
     self.scroll_bottom = new_rows -| 1;
     self.scroll_top = 0;
 
+    // Resize the inactive alt buffer if it exists.
+    // Content in the inactive buffer is not preserved on resize — this
+    // matches behavior of most terminals (xterm, Alacritty, Kitty).
+    if (self.alt_cells) |old_alt| {
+        allocator.free(old_alt);
+        const alt_cells = try allocator.alloc(Cell, new_total);
+        for (alt_cells) |*c| c.* = Cell.blank();
+        self.alt_cells = alt_cells;
+    }
+
     // Clamp cursor
     self.cursor_row = @min(self.cursor_row, new_rows -| 1);
     self.cursor_col = @min(self.cursor_col, new_cols -| 1);
@@ -309,6 +330,160 @@ pub fn saveCursor(self: *Grid) void {
 pub fn restoreCursor(self: *Grid) void {
     self.cursor_row = @min(self.saved_cursor_row, self.rows -| 1);
     self.cursor_col = @min(self.saved_cursor_col, self.cols -| 1);
+}
+
+/// Switch to alternate screen buffer. Saves cursor and main cells,
+/// clears the alt screen, and positions cursor at (0,0).
+/// If alt_cells hasn't been allocated yet, allocates them.
+pub fn switchToAltScreen(self: *Grid, allocator: std.mem.Allocator) !void {
+    // Save main screen cursor
+    self.alt_saved_cursor_row = self.cursor_row;
+    self.alt_saved_cursor_col = self.cursor_col;
+
+    const total = @as(usize, self.rows) * @as(usize, self.cols);
+
+    if (self.alt_cells) |alt| {
+        // Alt buffer already allocated — swap cells into it
+        // Store main cells in alt_cells, use alt as active cells
+        const main_cells = self.cells;
+        self.cells = alt;
+        self.alt_cells = main_cells;
+    } else {
+        // First time: allocate alt buffer, swap main into it
+        const alt = try allocator.alloc(Cell, total);
+        // Move main cells to alt storage
+        const main_cells = self.cells;
+        self.alt_cells = main_cells;
+        self.cells = alt;
+    }
+
+    // Clear the now-active alt screen
+    for (self.cells) |*c| c.* = Cell.blank();
+    self.cursor_row = 0;
+    self.cursor_col = 0;
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows -| 1;
+    self.dirty = true;
+}
+
+/// Switch back to the main screen buffer. Restores saved cursor and
+/// swaps the main cells back into active use.
+pub fn switchToMainScreen(self: *Grid) void {
+    if (self.alt_cells) |main_cells| {
+        // Swap: alt_cells holds main, cells is alt
+        const alt = self.cells;
+        self.cells = main_cells;
+        self.alt_cells = alt;
+    }
+
+    // Restore main screen cursor
+    self.cursor_row = @min(self.alt_saved_cursor_row, self.rows -| 1);
+    self.cursor_col = @min(self.alt_saved_cursor_col, self.cols -| 1);
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows -| 1;
+    self.dirty = true;
+}
+
+/// Insert n blank lines at the cursor row (within scroll region).
+/// Lines below shift down; lines pushed past scroll_bottom are lost.
+pub fn insertLines(self: *Grid, n: u16) void {
+    if (self.cursor_row < self.scroll_top or self.cursor_row > self.scroll_bottom) return;
+    const count = @min(n, self.scroll_bottom - self.cursor_row + 1);
+    const w: usize = self.cols;
+
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        // Shift rows down from scroll_bottom toward cursor_row
+        var row: usize = self.scroll_bottom;
+        while (row > self.cursor_row) : (row -= 1) {
+            const dst = row * w;
+            const src = (row - 1) * w;
+            @memcpy(self.cells[dst..][0..w], self.cells[src..][0..w]);
+        }
+        self.clearRow(self.cursor_row);
+    }
+    self.dirty = true;
+}
+
+/// Delete n lines at the cursor row (within scroll region).
+/// Lines below shift up; blank lines appear at scroll_bottom.
+pub fn deleteLines(self: *Grid, n: u16) void {
+    if (self.cursor_row < self.scroll_top or self.cursor_row > self.scroll_bottom) return;
+    const count = @min(n, self.scroll_bottom - self.cursor_row + 1);
+    const w: usize = self.cols;
+
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        // Shift rows up from cursor_row toward scroll_bottom
+        var row: usize = self.cursor_row;
+        while (row < self.scroll_bottom) : (row += 1) {
+            const dst = row * w;
+            const src = (row + 1) * w;
+            @memcpy(self.cells[dst..][0..w], self.cells[src..][0..w]);
+        }
+        self.clearRow(@intCast(self.scroll_bottom));
+    }
+    self.dirty = true;
+}
+
+/// Delete n characters at cursor position, shifting the rest of the line left.
+/// Blank cells appear at the right edge.
+pub fn deleteChars(self: *Grid, n: u16) void {
+    const row: usize = self.cursor_row;
+    const col: usize = self.cursor_col;
+    const w: usize = self.cols;
+    const count: usize = @min(n, w - col);
+    const row_start = row * w;
+
+    // Shift cells left
+    if (col + count < w) {
+        const remaining = w - col - count;
+        const dst = row_start + col;
+        const src = row_start + col + count;
+        var j: usize = 0;
+        while (j < remaining) : (j += 1) {
+            self.cells[dst + j] = self.cells[src + j];
+        }
+    }
+    // Blank the rightmost cells
+    const blank_start = row_start + w - count;
+    for (self.cells[blank_start..row_start + w]) |*c| c.* = Cell.blank();
+    self.dirty = true;
+}
+
+/// Insert n blank characters at cursor position, shifting existing chars right.
+/// Characters pushed past the right edge are lost.
+pub fn insertBlanks(self: *Grid, n: u16) void {
+    const row: usize = self.cursor_row;
+    const col: usize = self.cursor_col;
+    const w: usize = self.cols;
+    const count: usize = @min(n, w - col);
+    const row_start = row * w;
+
+    // Shift cells right (from end to avoid overlap)
+    if (col + count < w) {
+        const remaining = w - col - count;
+        var j: usize = remaining;
+        while (j > 0) {
+            j -= 1;
+            self.cells[row_start + col + count + j] = self.cells[row_start + col + j];
+        }
+    }
+    // Blank the inserted cells
+    for (self.cells[row_start + col ..][0..count]) |*c| c.* = Cell.blank();
+    self.dirty = true;
+}
+
+/// Erase n characters at cursor position (overwrite with blanks, no shift).
+pub fn eraseChars(self: *Grid, n: u16) void {
+    const row: usize = self.cursor_row;
+    const col: usize = self.cursor_col;
+    const w: usize = self.cols;
+    const count: usize = @min(n, w - col);
+    const row_start = row * w;
+
+    for (self.cells[row_start + col ..][0..count]) |*c| c.* = Cell.blank();
+    self.dirty = true;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -582,4 +757,147 @@ test "scrollUp with no scrollback is safe" {
     grid.scrollUp();
 
     try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(2, 0).char);
+}
+
+test "insertLines" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 3);
+    defer grid.deinit(allocator);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(1, 0).char = 'B';
+    grid.cellAt(2, 0).char = 'C';
+    grid.cellAt(3, 0).char = 'D';
+
+    grid.cursor_row = 1;
+    grid.insertLines(1);
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(2, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(3, 0).char);
+}
+
+test "deleteLines" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 3);
+    defer grid.deinit(allocator);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(1, 0).char = 'B';
+    grid.cellAt(2, 0).char = 'C';
+    grid.cellAt(3, 0).char = 'D';
+
+    grid.cursor_row = 1;
+    grid.deleteLines(1);
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'D'), grid.cellAtConst(2, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(3, 0).char);
+}
+
+test "deleteChars" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(0, 1).char = 'B';
+    grid.cellAt(0, 2).char = 'C';
+    grid.cellAt(0, 3).char = 'D';
+    grid.cellAt(0, 4).char = 'E';
+
+    grid.cursor_row = 0;
+    grid.cursor_col = 1;
+    grid.deleteChars(2);
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'D'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'E'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 4).char);
+}
+
+test "insertBlanks" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(0, 1).char = 'B';
+    grid.cellAt(0, 2).char = 'C';
+    grid.cellAt(0, 3).char = 'D';
+    grid.cellAt(0, 4).char = 'E';
+
+    grid.cursor_row = 0;
+    grid.cursor_col = 1;
+    grid.insertBlanks(2);
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(0, 4).char);
+}
+
+test "eraseChars" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(0, 1).char = 'B';
+    grid.cellAt(0, 2).char = 'C';
+    grid.cellAt(0, 3).char = 'D';
+    grid.cellAt(0, 4).char = 'E';
+
+    grid.cursor_row = 0;
+    grid.cursor_col = 1;
+    grid.eraseChars(3);
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'E'), grid.cellAtConst(0, 4).char);
+}
+
+test "switchToAltScreen and switchToMainScreen" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 4);
+    defer grid.deinit(allocator);
+
+    // Write content to main screen
+    grid.cellAt(0, 0).char = 'M';
+    grid.cellAt(0, 1).char = 'A';
+    grid.cellAt(0, 2).char = 'I';
+    grid.cellAt(0, 3).char = 'N';
+    grid.cursor_row = 2;
+    grid.cursor_col = 3;
+
+    // Switch to alt screen
+    try grid.switchToAltScreen(allocator);
+
+    // Alt screen should be blank
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+
+    // Write on alt screen
+    grid.cellAt(1, 0).char = 'A';
+    grid.cellAt(1, 1).char = 'L';
+    grid.cellAt(1, 2).char = 'T';
+
+    // Switch back to main
+    grid.switchToMainScreen();
+
+    // Main content should be restored
+    try std.testing.expectEqual(@as(u21, 'M'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'I'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'N'), grid.cellAtConst(0, 3).char);
+    // Main cursor should be restored
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_col);
 }

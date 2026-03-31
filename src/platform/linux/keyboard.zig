@@ -128,6 +128,13 @@ pub const Keyboard = struct {
         xkb_context_unref(self.ctx);
     }
 
+    /// Get the keysym for a keycode without updating key state.
+    /// Use this to peek at the keysym before processKey() consumes it.
+    /// Safe because xkb_state_key_get_one_sym is a pure query.
+    pub fn getKeysym(self: *Keyboard, keycode: u32) u32 {
+        return xkb_state_key_get_one_sym(self.state, keycode);
+    }
+
     /// Translate a raw XCB keycode to bytes for the PTY.
     pub fn processKey(self: *Keyboard, keycode: u32, pressed: bool, buf: []u8) usize {
         if (pressed) {

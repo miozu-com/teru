@@ -30,6 +30,7 @@ pub const MAX_OSC_LEN = 256;
 
 state: State = .ground,
 grid: *Grid,
+allocator: std.mem.Allocator,
 
 /// File descriptor for sending responses back to the PTY (DA1, DSR, etc.)
 /// Set to the PTY master fd by the Pane after init. -1 = no responses.
@@ -62,34 +63,50 @@ cursor_visible: bool = true,
 /// Alt screen active
 alt_screen: bool = false,
 
+/// Last printed character (for REP / ESC[b)
+last_char: u21 = ' ',
+
+/// Bracketed paste mode (ESC[?2004h/l)
+bracketed_paste: bool = false,
+
+/// Application cursor keys mode (ESC[?1h/l — DECCKM)
+app_cursor_keys: bool = false,
+
+/// Auto-wrap mode (ESC[?7h/l — DECAWM), on by default
+auto_wrap: bool = true,
+
 /// Agent protocol: last OSC 9999 payload for external consumption
 agent_event_buf: [512]u8 = undefined,
 agent_event_len: usize = 0,
 has_agent_event: bool = false,
 
-/// Whether DA1/DSR responses are enabled. Disabled during startup to prevent
-/// echo-back (shell re-enables ECHO on init). Enabled after event loop starts.
-responses_enabled: bool = false,
 
-pub fn init(grid: *Grid) VtParser {
-    return .{ .grid = grid };
+pub fn init(allocator: std.mem.Allocator, grid: *Grid) VtParser {
+    return .{ .grid = grid, .allocator = allocator };
 }
 
 /// Send a response back to the PTY (for DA1, DSR, etc.)
+/// ECHO is disabled on the slave termios from the master side at PTY
+/// creation, so response bytes written here are delivered to the shell's
+/// stdin without being echoed back to the master as output.
 fn sendResponse(self: *const VtParser, data: []const u8) void {
-    if (self.responses_enabled and self.response_fd >= 0) {
+    if (self.response_fd >= 0) {
         _ = std.c.write(self.response_fd, data.ptr, data.len);
     }
 }
 
-/// Create a VtParser with an undefined grid pointer.
+/// Create a VtParser with an undefined grid pointer and allocator.
 /// MUST call setGrid() before feeding any data.
 pub fn initEmpty() VtParser {
-    return .{ .grid = undefined };
+    return .{ .grid = undefined, .allocator = undefined };
 }
 
 pub fn setGrid(self: *VtParser, grid: *Grid) void {
     self.grid = grid;
+}
+
+pub fn setAllocator(self: *VtParser, allocator: std.mem.Allocator) void {
+    self.allocator = allocator;
 }
 
 /// Feed a slice of bytes into the parser.
@@ -166,7 +183,10 @@ fn writeGroundBatch(self: *VtParser, run: []const u8) void {
         cell.attrs = grid.pen_attrs;
         grid.cursor_col += 1;
     }
-    if (run.len > 0) grid.dirty = true;
+    if (run.len > 0) {
+        self.last_char = @as(u21, run[run.len - 1]);
+        grid.dirty = true;
+    }
 }
 
 /// Process a single byte through the state machine.
@@ -223,7 +243,9 @@ fn handleGround(self: *VtParser, byte: u8) void {
             if (byte >= 0x80) {
                 self.handleUtf8(byte);
             } else {
-                self.grid.write(@as(u21, byte));
+                const ch: u21 = @as(u21, byte);
+                self.grid.write(ch);
+                self.last_char = ch;
             }
         },
     }
@@ -258,6 +280,7 @@ fn handleUtf8(self: *VtParser, byte: u8) void {
             self.utf8_len = 0;
             self.utf8_expected = 0;
             self.grid.write(cp);
+            self.last_char = cp;
         }
     } else {
         // Invalid byte — reset decoder, emit replacement character
@@ -469,6 +492,25 @@ fn finishOsc(self: *VtParser) void {
                 @memcpy(self.title[0..copy_len], payload[0..copy_len]);
                 self.title_len = @intCast(copy_len);
             },
+            10 => {
+                // Query/set foreground color. "?" = query.
+                if (payload.len == 1 and payload[0] == '?') {
+                    // Respond with default foreground (white)
+                    self.sendResponse("\x1b]10;rgb:ff/ff/ff\x1b\\");
+                }
+                // Setting foreground color: silently accepted (no visual effect yet)
+            },
+            11 => {
+                // Query/set background color. "?" = query.
+                if (payload.len == 1 and payload[0] == '?') {
+                    // Respond with default background (black)
+                    self.sendResponse("\x1b]11;rgb:00/00/00\x1b\\");
+                }
+            },
+            52 => {
+                // Clipboard (OSC 52). Format: "c;BASE64" or "c;?" for query.
+                // Silently accepted — clipboard integration requires platform support.
+            },
             9999 => {
                 // Agent protocol — store payload for external consumption
                 if (payload.len <= self.agent_event_buf.len) {
@@ -565,6 +607,18 @@ fn dispatchCsi(self: *VtParser, final: u8) void {
             const mode: u8 = @intCast(self.getParam(0, 0));
             self.grid.clearLine(self.grid.cursor_row, mode);
         },
+        'L' => { // IL — insert lines
+            const n = self.getParam(0, 1);
+            self.grid.insertLines(n);
+        },
+        'M' => { // DL — delete lines
+            const n = self.getParam(0, 1);
+            self.grid.deleteLines(n);
+        },
+        'P' => { // DCH — delete characters
+            const n = self.getParam(0, 1);
+            self.grid.deleteChars(n);
+        },
         'S' => { // SU — scroll up
             const n = self.getParam(0, 1);
             self.grid.scrollUpN(n);
@@ -572,6 +626,25 @@ fn dispatchCsi(self: *VtParser, final: u8) void {
         'T' => { // SD — scroll down
             const n = self.getParam(0, 1);
             self.grid.scrollDownN(n);
+        },
+        'X' => { // ECH — erase characters (overwrite with blanks, no shift)
+            const n = self.getParam(0, 1);
+            self.grid.eraseChars(n);
+        },
+        '@' => { // ICH — insert blank characters
+            const n = self.getParam(0, 1);
+            self.grid.insertBlanks(n);
+        },
+        '`' => { // HPA — horizontal position absolute (1-based, same as CHA)
+            const col = self.getParam(0, 1);
+            self.grid.cursor_col = if (col == 0) 0 else @min(col - 1, self.grid.cols -| 1);
+        },
+        'b' => { // REP — repeat last character
+            const n = self.getParam(0, 1);
+            var i: u16 = 0;
+            while (i < n) : (i += 1) {
+                self.grid.write(self.last_char);
+            }
         },
         'd' => { // VPA — vertical position absolute (1-based)
             const row = self.getParam(0, 1);
@@ -594,11 +667,27 @@ fn dispatchCsi(self: *VtParser, final: u8) void {
             self.grid.cursor_row = 0;
             self.grid.cursor_col = 0;
         },
+        'n' => { // DSR — device status report (non-private form)
+            const p = self.getParam(0, 0);
+            if (p == 5) {
+                self.sendResponse("\x1b[0n");
+            } else if (p == 6) {
+                var buf: [32]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
+                    self.grid.cursor_row + 1,
+                    self.grid.cursor_col + 1,
+                }) catch return;
+                self.sendResponse(msg);
+            }
+        },
         's' => { // SCP — save cursor position
             self.grid.saveCursor();
         },
         'u' => { // RCP — restore cursor position
             self.grid.restoreCursor();
+        },
+        'c' => { // DA1 — primary device attributes (non-private form: ESC[c)
+            self.sendResponse("\x1b[?62;22c");
         },
         else => {
             // Unknown CSI final byte: ignore
@@ -611,24 +700,35 @@ fn dispatchCsiPrivate(self: *VtParser, final: u8) void {
     switch (final) {
         'h' => { // DECSET
             switch (mode) {
+                1 => self.app_cursor_keys = true, // DECCKM
+                7 => self.auto_wrap = true, // DECAWM
+                12 => {}, // Cursor blink — accepted, no visual effect yet
                 25 => self.cursor_visible = true, // show cursor
-                1049 => { // alt screen on
-                    self.alt_screen = true;
-                    self.grid.saveCursor();
-                    self.grid.clearScreen(2);
-                    self.grid.cursor_row = 0;
-                    self.grid.cursor_col = 0;
+                47, 1047, 1049 => { // Alt screen on
+                    if (!self.alt_screen) {
+                        self.alt_screen = true;
+                        self.grid.switchToAltScreen(self.allocator) catch {};
+                    }
                 },
+                2004 => self.bracketed_paste = true,
+                1006 => {}, // SGR mouse mode — accepted, no effect yet
                 else => {},
             }
         },
         'l' => { // DECRST
             switch (mode) {
+                1 => self.app_cursor_keys = false, // DECCKM
+                7 => self.auto_wrap = false, // DECAWM
+                12 => {}, // Cursor blink off — accepted
                 25 => self.cursor_visible = false, // hide cursor
-                1049 => { // alt screen off
-                    self.alt_screen = false;
-                    self.grid.restoreCursor();
+                47, 1047, 1049 => { // Alt screen off
+                    if (self.alt_screen) {
+                        self.alt_screen = false;
+                        self.grid.switchToMainScreen();
+                    }
                 },
+                2004 => self.bracketed_paste = false,
+                1006 => {}, // SGR mouse mode off — accepted
                 else => {},
             }
         },
@@ -757,7 +857,7 @@ test "plain text" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("Hello");
 
@@ -774,7 +874,7 @@ test "CR and LF" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("AB\r\nCD");
 
@@ -788,7 +888,7 @@ test "backspace" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("AB\x08C");
 
@@ -801,7 +901,7 @@ test "tab stops" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("A\tB");
     try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
@@ -812,7 +912,7 @@ test "CSI cursor movement" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Move cursor to row 5, col 10 (1-based)
     parser.feed("\x1b[5;10H");
@@ -840,7 +940,7 @@ test "CSI cursor position home" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("Hello\x1b[H");
     try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
@@ -851,7 +951,7 @@ test "SGR basic attributes" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Bold + italic on
     parser.feed("\x1b[1;3mA");
@@ -870,7 +970,7 @@ test "SGR standard colors" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Red foreground (31), blue background (44)
     parser.feed("\x1b[31;44mX");
@@ -883,7 +983,7 @@ test "SGR 256-color" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // 256-color foreground: index 208 (orange)
     parser.feed("\x1b[38;5;208mA");
@@ -895,7 +995,7 @@ test "SGR truecolor" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Truecolor foreground: RGB(255, 128, 0)
     parser.feed("\x1b[38;2;255;128;0mA");
@@ -907,7 +1007,7 @@ test "erase display" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 3, 5);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("ABCDE\r\nFGHIJ\r\nKLMNO");
 
@@ -922,7 +1022,7 @@ test "erase line" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 3, 5);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("ABCDE");
     // Move cursor to column 2
@@ -940,7 +1040,7 @@ test "scroll up and down" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 3, 4);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     grid.cellAt(0, 0).char = 'A';
     grid.cellAt(1, 0).char = 'B';
@@ -963,7 +1063,7 @@ test "cursor save and restore via CSI" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("\x1b[5;10H"); // Move to (4,9)
     parser.feed("\x1b[s"); // Save
@@ -978,7 +1078,7 @@ test "cursor save and restore via DEC" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("\x1b[5;10H"); // Move to (4,9)
     parser.feed("\x1b" ++ "7"); // ESC 7 — save
@@ -993,7 +1093,7 @@ test "cursor visibility" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     try std.testing.expect(parser.cursor_visible);
 
@@ -1004,22 +1104,34 @@ test "cursor visibility" {
     try std.testing.expect(parser.cursor_visible);
 }
 
-test "alt screen" {
+test "alt screen preserves and restores main content" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("Hello"); // Write some text
     parser.feed("\x1b[5;10H"); // Move cursor
 
     parser.feed("\x1b[?1049h"); // Alt screen on
     try std.testing.expect(parser.alt_screen);
-    // Screen should be cleared
+    // Screen should be cleared (alt screen is blank)
     try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 0).char);
+    // Cursor should be at (0,0) on alt screen
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+
+    // Write something on the alt screen
+    parser.feed("Alt!");
 
     parser.feed("\x1b[?1049l"); // Alt screen off
     try std.testing.expect(!parser.alt_screen);
+    // Main screen content should be restored
+    try std.testing.expectEqual(@as(u21, 'H'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'e'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'o'), grid.cellAtConst(0, 4).char);
     // Cursor should be restored to saved position (4, 9)
     try std.testing.expectEqual(@as(u16, 4), grid.cursor_row);
     try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
@@ -1029,7 +1141,7 @@ test "OSC title" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("\x1b]0;My Terminal Title\x07");
     const expected = "My Terminal Title";
@@ -1040,7 +1152,7 @@ test "SGR reset with no params" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("\x1b[1mA"); // Bold
     try std.testing.expect(grid.cellAtConst(0, 0).attrs.bold);
@@ -1053,7 +1165,7 @@ test "multiple CSI params" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Bold + underline + red fg + blue bg in one sequence
     parser.feed("\x1b[1;4;31;44mX");
@@ -1068,7 +1180,7 @@ test "scroll region" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 5, 4);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Set scroll region to rows 2-4 (1-based)
     parser.feed("\x1b[2;4r");
@@ -1135,7 +1247,7 @@ test "SIMD fast-path — batched ground write produces same result as byte-by-by
     // Reference: byte-by-byte through processByte
     var grid_ref = try Grid.init(allocator, 24, 80);
     defer grid_ref.deinit(allocator);
-    var parser_ref = VtParser.init(&grid_ref);
+    var parser_ref = VtParser.init(allocator, &grid_ref);
     const text = "The quick brown fox jumps over the lazy dog!";
     for (text) |byte| {
         parser_ref.processByte(byte);
@@ -1144,7 +1256,7 @@ test "SIMD fast-path — batched ground write produces same result as byte-by-by
     // Test: batched via feed() SIMD fast-path
     var grid_simd = try Grid.init(allocator, 24, 80);
     defer grid_simd.deinit(allocator);
-    var parser_simd = VtParser.init(&grid_simd);
+    var parser_simd = VtParser.init(allocator, &grid_simd);
     parser_simd.feed(text);
 
     // Both grids must match
@@ -1161,7 +1273,7 @@ test "SIMD fast-path — mixed text and escapes" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Text, then escape, then more text
     parser.feed("Hello\x1b[1mWorld");
@@ -1183,7 +1295,7 @@ test "OSC 9999 agent event with BEL terminator" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // No agent event initially
     try std.testing.expect(parser.consumeAgentEvent() == null);
@@ -1203,7 +1315,7 @@ test "OSC 9999 agent event with ESC backslash terminator" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     parser.feed("\x1b]9999;agent:status;state=working;progress=0.5\x1b");
 
@@ -1215,7 +1327,7 @@ test "OSC 9999 does not interfere with regular OSC title" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Regular title OSC
     parser.feed("\x1b]0;My Title\x07");
@@ -1232,7 +1344,7 @@ test "OSC 9999 interleaved with text" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // Text, then agent event, then more text
     parser.feed("Hello\x1b]9999;agent:task;task=Building\x07World");
@@ -1253,7 +1365,7 @@ test "UTF-8 2-byte sequence (é = U+00E9)" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // é = 0xC3 0xA9
     parser.feed(&[_]u8{ 0xC3, 0xA9 });
@@ -1265,7 +1377,7 @@ test "UTF-8 3-byte sequence (→ = U+2192)" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // → = 0xE2 0x86 0x92
     parser.feed(&[_]u8{ 0xE2, 0x86, 0x92 });
@@ -1277,7 +1389,7 @@ test "UTF-8 4-byte sequence (U+1F600 grinning face)" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // U+1F600 = 0xF0 0x9F 0x98 0x80
     parser.feed(&[_]u8{ 0xF0, 0x9F, 0x98, 0x80 });
@@ -1289,7 +1401,7 @@ test "UTF-8 mixed ASCII and multi-byte" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 24, 80);
     defer grid.deinit(allocator);
-    var parser = VtParser.init(&grid);
+    var parser = VtParser.init(allocator, &grid);
 
     // "Héllo" — H (ASCII), é (2-byte), l, l, o (ASCII)
     parser.feed("H\xC3\xA9llo");
@@ -1325,4 +1437,182 @@ test "SIMD findNextSpecial stops at high bytes" {
     try std.testing.expectEqual(@as(usize, 3), findNextSpecial("AB\x7F"));
     // 0x80 at position 2 — should stop (UTF-8 continuation byte territory)
     try std.testing.expectEqual(@as(usize, 2), findNextSpecial("AB\x80"));
+}
+
+// ── Issue 2: Missing VT sequence tests ─────────────────────────
+
+test "CSI L — insert lines" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 4);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // Fill rows: A, B, C, D
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(1, 0).char = 'B';
+    grid.cellAt(2, 0).char = 'C';
+    grid.cellAt(3, 0).char = 'D';
+
+    // Move cursor to row 2 (1-based), insert 1 line
+    parser.feed("\x1b[2;1H\x1b[L");
+
+    // Row 1 should now be blank (inserted), B moves to row 2, C to row 3
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(2, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(3, 0).char);
+}
+
+test "CSI M — delete lines" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 4, 4);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    grid.cellAt(0, 0).char = 'A';
+    grid.cellAt(1, 0).char = 'B';
+    grid.cellAt(2, 0).char = 'C';
+    grid.cellAt(3, 0).char = 'D';
+
+    // Move cursor to row 2, delete 1 line
+    parser.feed("\x1b[2;1H\x1b[M");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'D'), grid.cellAtConst(2, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(3, 0).char);
+}
+
+test "CSI P — delete characters" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    parser.feed("ABCDE");
+    // Move to col 2, delete 2 chars
+    parser.feed("\x1b[1;3H\x1b[2P");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'E'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 4).char);
+}
+
+test "CSI @ — insert blank characters" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    parser.feed("ABCDE");
+    // Move to col 2, insert 2 blanks
+    parser.feed("\x1b[1;3H\x1b[2@");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'C'), grid.cellAtConst(0, 4).char);
+}
+
+test "CSI X — erase characters" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 5);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    parser.feed("ABCDE");
+    // Move to col 1, erase 3 chars
+    parser.feed("\x1b[1;2H\x1b[3X");
+
+    try std.testing.expectEqual(@as(u21, 'A'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'E'), grid.cellAtConst(0, 4).char);
+}
+
+test "CSI b — repeat last character" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 3, 10);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    parser.feed("X\x1b[4b");
+
+    try std.testing.expectEqual(@as(u21, 'X'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.cellAtConst(0, 2).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.cellAtConst(0, 3).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.cellAtConst(0, 4).char);
+    try std.testing.expectEqual(@as(u16, 5), grid.cursor_col);
+}
+
+test "CSI backtick — HPA (same as CHA)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    parser.feed("\x1b[15`");
+    try std.testing.expectEqual(@as(u16, 14), grid.cursor_col);
+}
+
+test "bracketed paste mode" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    try std.testing.expect(!parser.bracketed_paste);
+    parser.feed("\x1b[?2004h");
+    try std.testing.expect(parser.bracketed_paste);
+    parser.feed("\x1b[?2004l");
+    try std.testing.expect(!parser.bracketed_paste);
+}
+
+test "application cursor keys mode" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    try std.testing.expect(!parser.app_cursor_keys);
+    parser.feed("\x1b[?1h");
+    try std.testing.expect(parser.app_cursor_keys);
+    parser.feed("\x1b[?1l");
+    try std.testing.expect(!parser.app_cursor_keys);
+}
+
+test "auto-wrap mode" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    try std.testing.expect(parser.auto_wrap); // on by default
+    parser.feed("\x1b[?7l");
+    try std.testing.expect(!parser.auto_wrap);
+    parser.feed("\x1b[?7h");
+    try std.testing.expect(parser.auto_wrap);
+}
+
+test "unknown CSI sequences are silently absorbed" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // Feed some unknown CSI sequences — should not produce text
+    parser.feed("\x1b[?12h"); // cursor blink (absorbed)
+    parser.feed("\x1b[?1006h"); // SGR mouse (absorbed)
+    parser.feed("\x1b[999Z"); // unknown final 'Z'
+    parser.feed("OK");
+
+    // Only "OK" should appear in the grid
+    try std.testing.expectEqual(@as(u21, 'O'), grid.cellAtConst(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'K'), grid.cellAtConst(0, 1).char);
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_col);
 }

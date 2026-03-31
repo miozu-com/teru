@@ -38,11 +38,12 @@ pub fn init(allocator: Allocator, rows: u16, cols: u16, id: u64) !Pane {
     };
 }
 
-/// Patch the VtParser's grid pointer to this Pane's grid.
+/// Patch the VtParser's grid pointer and allocator to this Pane's grid.
 /// MUST be called after the Pane is in its final memory location
 /// (after ArrayList.append or similar move).
-pub fn linkVt(self: *Pane) void {
+pub fn linkVt(self: *Pane, allocator: Allocator) void {
     self.vt.grid = &self.grid;
+    self.vt.allocator = allocator;
     self.vt.response_fd = self.pty.master;
 }
 

@@ -107,6 +107,22 @@ pub fn spawn(opts: SpawnOptions) !Pty {
     }
 
     // ── Parent process ───────────────────────────────────────────
+
+    // Disable ECHO on the slave's termios from the master side.
+    // tcsetattr(master) controls the slave's line discipline settings.
+    // This prevents DA1/DSR response bytes written to master from being
+    // echoed back by the PTY layer. The shell will re-enable ECHO when
+    // it sets up its own line editing, but by that time the initial
+    // device-attribute exchange has already completed.
+    if (posix.tcgetattr(master)) |attrs| {
+        var parent_attrs = attrs;
+        parent_attrs.lflag.ECHO = false;
+        parent_attrs.lflag.ECHOE = false;
+        parent_attrs.lflag.ECHOK = false;
+        parent_attrs.lflag.ECHONL = false;
+        posix.tcsetattr(master, .NOW, parent_attrs) catch {};
+    } else |_| {}
+
     return Pty{
         .master = master,
         .slave = 0, // Parent doesn't need the slave fd
