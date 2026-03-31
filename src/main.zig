@@ -22,7 +22,12 @@ const Keyboard = if (builtin.os.tag == .linux and build_options.enable_x11)
 else
     void;
 
-const version = "0.1.0";
+const Session = @import("persist/Session.zig");
+const UrlDetector = @import("core/UrlDetector.zig");
+
+const version = "0.2.0";
+
+const session_path = "/tmp/teru-session.bin";
 
 fn out(msg: []const u8) void {
     _ = std.c.write(posix.STDOUT_FILENO, msg.ptr, msg.len);
@@ -49,8 +54,11 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--help")) {
-            out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n\nScrollback:\n  Shift+PageUp    Scroll up one page\n  Shift+PageDown  Scroll down one page\n  Any key         Exit scroll mode\n\n");
+            out("teru — AI-first terminal emulator\n\nUsage: teru [options]\n\nOptions:\n  --help       Show this help\n  --version    Show version\n  --raw        Raw passthrough mode (no window)\n  --attach     Restore session from last detach\n\nMultiplexer keys (prefix: Ctrl+Space):\n  c     Spawn new pane\n  x     Close active pane\n  n     Focus next pane\n  p     Focus prev pane\n  1-9   Switch workspace\n  Space Cycle layout\n  d     Detach (save session, exit)\n  /     Search visible grid\n\nScrollback:\n  Shift+PageUp    Scroll up one page\n  Shift+PageDown  Scroll down one page\n  Any key         Exit scroll mode\n\nURL detection:\n  Ctrl+click on a URL to open in browser\n\n");
             return;
+        }
+        if (std.mem.eql(u8, arg, "--attach")) {
+            return runAttachMode(allocator, io);
         }
         if (std.mem.eql(u8, arg, "--raw")) {
             return runRawMode(allocator, io);
@@ -62,10 +70,35 @@ pub fn main(init: std.process.Init) !void {
     if (tier == .tty) {
         return runRawMode(allocator, io); // No display server, fall back to TTY
     }
-    return runWindowedMode(allocator, io);
+    return runWindowedMode(allocator, io, null);
 }
 
-fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
+/// Session restore info passed from --attach to runWindowedMode.
+const RestoreInfo = struct {
+    pane_count: u16,
+};
+
+fn runAttachMode(allocator: std.mem.Allocator, io: std.Io) !void {
+    var sess = Session.loadFromFile(session_path, allocator, io) catch {
+        out("[teru] No saved session found, starting fresh\n");
+        return runWindowedMode(allocator, io, null);
+    };
+    defer sess.deinit();
+
+    // Count shell nodes (kind == 0) to determine how many panes to restore
+    var shell_count: u16 = 0;
+    for (sess.graph_snapshot) |node| {
+        if (node.kind == 0) shell_count += 1;
+    }
+    if (shell_count == 0) shell_count = 1;
+
+    var msg_buf: [128]u8 = undefined;
+    outFmt(&msg_buf, "[teru] Restoring session ({d} panes)\n", .{shell_count});
+
+    return runWindowedMode(allocator, io, .{ .pane_count = shell_count });
+}
+
+fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io, restore: ?RestoreInfo) !void {
     // Load configuration from ~/.config/teru/teru.conf (defaults if missing)
     var config = try Config.load(allocator, io);
     defer config.deinit();
@@ -109,12 +142,15 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var mcp = McpServer.init(allocator, &mux, &graph) catch null;
     defer if (mcp) |*m| m.deinit();
 
-    // Spawn initial pane
-    const initial_id = try mux.spawnPane(grid_rows, grid_cols);
-    if (mux.getPaneById(initial_id)) |pane| {
-        _ = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid });
+    // Spawn panes (restore or fresh)
+    const pane_count: u16 = if (restore) |r| r.pane_count else 1;
+    for (0..pane_count) |_| {
+        const pid = try mux.spawnPane(grid_rows, grid_cols);
+        if (mux.getPaneById(pid)) |pane| {
+            _ = try graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid });
+        }
+        hooks.fire(.spawn);
     }
-    hooks.fire(.spawn);
 
     // Keyboard input: xkbcommon translates XCB keycodes → UTF-8
     // Uses the LIVE X11 keymap (supports dvorak, colemak, any layout)
@@ -149,6 +185,14 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
     var saved_cells: ?[]Grid.Cell = null;
     defer if (saved_cells) |sc| allocator.free(sc);
 
+    // Search mode state (Feature 9)
+    var search_mode = false;
+    var search_query: [256]u8 = undefined;
+    var search_len: usize = 0;
+    _ = &search_mode;
+    _ = &search_query;
+    _ = &search_len;
+
     while (running) {
         // Check prefix timeout
         if (prefix.isExpired()) {
@@ -173,13 +217,48 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                     grid_cols = new_cols;
                     grid_rows = new_rows;
 
-                    // Resize all panes in the active workspace
-                    // In multi-pane mode, panes share the screen — each gets
-                    // a portion. For simplicity, resize all to the max grid
-                    // size and let renderAll handle clipping via layout rects.
-                    for (mux.panes.items) |*pane| {
-                        if (new_cols != pane.grid.cols or new_rows != pane.grid.rows) {
-                            pane.resize(allocator, new_rows, new_cols) catch continue;
+                    // Proportional pane resize: calculate layout rects and
+                    // resize each pane to its allocated portion of the screen.
+                    const LayoutRect = @import("tiling/LayoutEngine.zig").Rect;
+                    const screen_rect = LayoutRect{
+                        .x = 0,
+                        .y = 0,
+                        .width = @intCast(@min(sz.width, std.math.maxInt(u16))),
+                        .height = @intCast(@min(sz.height, std.math.maxInt(u16))),
+                    };
+                    const ws = &mux.layout_engine.workspaces[mux.active_workspace];
+                    const node_ids = ws.node_ids.items;
+                    if (node_ids.len > 1) {
+                        if (mux.layout_engine.calculate(mux.active_workspace, screen_rect)) |rects| {
+                            defer allocator.free(rects);
+                            for (rects, 0..) |rect, i| {
+                                if (i >= node_ids.len) break;
+                                if (rect.width == 0 or rect.height == 0) continue;
+                                const cw16: u16 = @intCast(atlas.cell_width);
+                                const ch16: u16 = @intCast(atlas.cell_height);
+                                const pane_cols: u16 = rect.width / cw16;
+                                const pane_rows: u16 = rect.height / ch16;
+                                if (pane_cols == 0 or pane_rows == 0) continue;
+                                if (mux.getPaneById(node_ids[i])) |pane| {
+                                    if (pane_cols != pane.grid.cols or pane_rows != pane.grid.rows) {
+                                        pane.resize(allocator, pane_rows, pane_cols) catch continue;
+                                    }
+                                }
+                            }
+                        } else |_| {
+                            // Layout calc failed — fall back to uniform resize
+                            for (mux.panes.items) |*pane| {
+                                if (new_cols != pane.grid.cols or new_rows != pane.grid.rows) {
+                                    pane.resize(allocator, new_rows, new_cols) catch continue;
+                                }
+                            }
+                        }
+                    } else {
+                        // Single pane: resize to full grid
+                        for (mux.panes.items) |*pane| {
+                            if (new_cols != pane.grid.cols or new_rows != pane.grid.rows) {
+                                pane.resize(allocator, new_rows, new_cols) catch continue;
+                            }
                         }
                     }
 
@@ -196,12 +275,45 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                 .key_press => |key| {
                     const XKB_KEY_Page_Up: u32 = 0xff55;
                     const XKB_KEY_Page_Down: u32 = 0xff56;
+                    const XKB_KEY_Return: u32 = 0xff0d;
+                    const XKB_KEY_Escape: u32 = 0xff1b;
+                    const XKB_KEY_BackSpace: u32 = 0xff08;
                     const SHIFT_MASK: u32 = 1; // XCB ShiftMask
 
                     if (Keyboard != void) {
                         if (keyboard) |*kb| {
                             // Peek keysym before processKey updates state
                             const keysym = kb.getKeysym(key.keycode);
+
+                            // Search mode: intercept all keys for the search query
+                            if (search_mode) {
+                                var search_key_buf: [32]u8 = undefined;
+                                const slen = kb.processKey(key.keycode, true, &search_key_buf);
+
+                                if (keysym == XKB_KEY_Escape) {
+                                    // Cancel search
+                                    search_mode = false;
+                                    search_len = 0;
+                                    if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                } else if (keysym == XKB_KEY_Return) {
+                                    // Confirm and exit search
+                                    search_mode = false;
+                                    if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                } else if (keysym == XKB_KEY_BackSpace) {
+                                    if (search_len > 0) {
+                                        search_len -= 1;
+                                        if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                    }
+                                } else if (slen > 0 and search_key_buf[0] >= 32 and search_key_buf[0] < 127) {
+                                    // Printable ASCII character
+                                    if (search_len < search_query.len) {
+                                        search_query[search_len] = search_key_buf[0];
+                                        search_len += 1;
+                                        if (mux.getActivePane()) |pane| pane.grid.dirty = true;
+                                    }
+                                }
+                                continue;
+                            }
 
                             // Shift+PageUp/Down: scrollback browsing
                             if (key.modifiers & SHIFT_MASK != 0) {
@@ -258,7 +370,8 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                             if (prefix.awaiting) {
                                 prefix.reset();
                                 if (len > 0) {
-                                    KeyHandler.handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
+                                    const action = KeyHandler.handleMuxCommand(key_buf[0], &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
+                                    if (action == .enter_search) search_mode = true;
                                     continue;
                                 }
                             }
@@ -288,7 +401,8 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                         if (prefix.awaiting) {
                             prefix.reset();
                             if (key.keycode < 128) {
-                                KeyHandler.handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
+                                const action = KeyHandler.handleMuxCommand(@truncate(key.keycode), &mux, &graph, &hooks, &running, grid_rows, grid_cols, io);
+                                if (action == .enter_search) search_mode = true;
                                 continue;
                             }
                         }
@@ -312,6 +426,26 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                 .mouse_press => |mouse| {
                     switch (mouse.button) {
                         .left => {
+                            const col: u16 = @intCast(@min(mouse.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
+                            const row: u16 = @intCast(@min(mouse.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
+
+                            // Ctrl+click: open URL under cursor
+                            const CTRL_MASK: u32 = 4; // XCB ControlMask
+                            if (mouse.modifiers & CTRL_MASK != 0) {
+                                if (mux.getActivePane()) |pane| {
+                                    if (UrlDetector.findUrlAt(&pane.grid, row, col)) |match| {
+                                        const row_start = @as(usize, match.row) * @as(usize, pane.grid.cols);
+                                        const row_cells = pane.grid.cells[row_start..][0..pane.grid.cols];
+                                        var url_buf: [2048]u8 = undefined;
+                                        const url_len = UrlDetector.extractUrl(row_cells, match, &url_buf);
+                                        if (url_len > 0) {
+                                            UrlDetector.openUrl(url_buf[0..url_len]);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Clear any existing selection on click
                             if (selection.active) {
                                 selection.clear();
@@ -319,8 +453,6 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                             }
                             // Record click position — don't start selection yet.
                             // Selection only begins on mouse_motion (drag).
-                            const col: u16 = @intCast(@min(mouse.x / atlas.cell_width, @as(u32, grid_cols -| 1)));
-                            const row: u16 = @intCast(@min(mouse.y / atlas.cell_height, @as(u32, grid_rows -| 1)));
                             mouse_start_row = row;
                             mouse_start_col = col;
                             mouse_down = true;
@@ -434,6 +566,16 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
             }
         }
 
+        // Window title: update from active pane's VT parser
+        if (mux.getActivePane()) |pane| {
+            if (pane.vt.title_changed) {
+                if (pane.vt.title_len > 0) {
+                    win.setTitle(pane.vt.title[0..pane.vt.title_len]);
+                }
+                pane.vt.title_changed = false;
+            }
+        }
+
         // Check if any pane's grid is dirty
         var any_dirty = had_output;
         if (!any_dirty) {
@@ -446,6 +588,21 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
         }
 
         if (any_dirty) {
+            // Visual bell: invert framebuffer for one frame when BEL received
+            for (mux.panes.items) |*pane| {
+                if (pane.grid.bell) {
+                    pane.grid.bell = false;
+                    switch (renderer) {
+                        .cpu => |*cpu| {
+                            for (cpu.framebuffer) |*pixel| {
+                                pixel.* ^= 0x00FFFFFF;
+                            }
+                        },
+                        .tty => {},
+                    }
+                }
+            }
+
             // Scrollback overlay: temporarily replace grid cells with scrollback text
             if (scroll_offset > 0) {
                 if (mux.getActivePane()) |pane| {
@@ -466,6 +623,17 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
                     const sz = win.getSize();
                     const sel_ptr: ?*const Selection = if (selection.active) &selection else null;
                     mux.renderAllWithSelection(cpu, sz.width, sz.height, atlas.cell_width, atlas.cell_height, sel_ptr);
+
+                    // Search overlay: highlight matches + draw search bar
+                    if (search_mode or search_len > 0) {
+                        if (mux.getActivePane()) |pane| {
+                            renderSearchOverlay(cpu, &pane.grid, search_query[0..search_len], search_mode, atlas.cell_width, atlas.cell_height);
+                        }
+                    }
+
+                    // Status bar with text (Feature 10)
+                    renderTextStatusBar(cpu, &mux, grid_cols, grid_rows, atlas.cell_width, atlas.cell_height);
+
                     win.putFramebuffer(cpu.getFramebuffer(), sz.width, sz.height);
                 },
                 .tty => {},
@@ -477,6 +645,258 @@ fn runWindowedMode(allocator: std.mem.Allocator, io: std.Io) !void {
         } else {
             // 1ms idle sleep via native Io.sleep
             io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+}
+
+// ── Search overlay rendering (Feature 9) ─────────────────────────
+
+/// Render search highlights on matching cells and draw search input bar.
+fn renderSearchOverlay(
+    cpu: *render.SoftwareRenderer,
+    grid: *const Grid,
+    query: []const u8,
+    active: bool,
+    cell_width: u32,
+    cell_height: u32,
+) void {
+    const fb_w: usize = cpu.width;
+    const fb_h: usize = cpu.height;
+    const cw: usize = cell_width;
+    const ch: usize = cell_height;
+
+    // Highlight matching cells with a yellow tint
+    if (query.len > 0) {
+        for (0..grid.rows) |row| {
+            var col: usize = 0;
+            while (col + query.len <= grid.cols) {
+                var match = true;
+                for (query, 0..) |qch, qi| {
+                    const cell = grid.cellAtConst(@intCast(row), @intCast(col + qi));
+                    const cell_lower: u8 = if (cell.char >= 'A' and cell.char <= 'Z') @intCast(cell.char + 32) else if (cell.char < 128) @intCast(cell.char) else 0;
+                    const q_lower: u8 = if (qch >= 'A' and qch <= 'Z') qch + 32 else qch;
+                    if (cell_lower != q_lower) {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match) {
+                    for (0..query.len) |qi| {
+                        const sx = (col + qi) * cw;
+                        const sy = row * ch;
+                        for (sy..@min(sy + ch, fb_h)) |py| {
+                            for (sx..@min(sx + cw, fb_w)) |px| {
+                                const idx = py * fb_w + px;
+                                if (idx < cpu.framebuffer.len) {
+                                    const orig = cpu.framebuffer[idx];
+                                    const r: u32 = (orig >> 16) & 0xFF;
+                                    const g: u32 = (orig >> 8) & 0xFF;
+                                    const b: u32 = orig & 0xFF;
+                                    const nr: u32 = @min(255, (r * 6 + 255 * 4) / 10);
+                                    const ng: u32 = @min(255, (g * 6 + 204 * 4) / 10);
+                                    const nb: u32 = b * 6 / 10;
+                                    cpu.framebuffer[idx] = (@as(u32, 0xFF) << 24) | (nr << 16) | (ng << 8) | nb;
+                                }
+                            }
+                        }
+                    }
+                    col += query.len;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+    }
+
+    // Draw search bar at the bottom if actively searching
+    if (active) {
+        const bar_h: usize = ch + 4;
+        if (fb_h < bar_h + 10) return;
+        const bar_y = fb_h - bar_h;
+        const bar_bg: u32 = 0xFF2A2A36;
+
+        for (bar_y..fb_h) |y| {
+            if (y >= fb_h) break;
+            const row_start = y * fb_w;
+            const end = @min(row_start + fb_w, cpu.framebuffer.len);
+            if (row_start < end) {
+                @memset(cpu.framebuffer[row_start..end], bar_bg);
+            }
+        }
+
+        // Orange separator line
+        if (bar_y > 0) {
+            const sep_start = bar_y * fb_w;
+            const sep_end = @min(sep_start + fb_w, cpu.framebuffer.len);
+            if (sep_start < sep_end) {
+                @memset(cpu.framebuffer[sep_start..sep_end], 0xFFFF9922);
+            }
+        }
+
+        // Render prompt and query text
+        const text_y = bar_y + 2;
+        var text_x: usize = 4;
+
+        blitCharAt(cpu, '/', text_x, text_y, 0xFFFF9922);
+        text_x += cw;
+
+        for (query) |qch| {
+            blitCharAt(cpu, qch, text_x, text_y, 0xFFFAF8FB);
+            text_x += cw;
+        }
+
+        // Cursor line
+        for (text_y..@min(text_y + ch, fb_h)) |py| {
+            if (text_x < fb_w) {
+                const idx = py * fb_w + text_x;
+                if (idx < cpu.framebuffer.len) {
+                    cpu.framebuffer[idx] = 0xFFFAF8FB;
+                }
+            }
+        }
+    }
+}
+
+// ── Text status bar rendering (Feature 10) ───────────────────────
+
+/// Render a text status bar at the very bottom of the framebuffer.
+fn renderTextStatusBar(
+    cpu: *render.SoftwareRenderer,
+    mux: *const Multiplexer,
+    grid_cols: u16,
+    grid_rows: u16,
+    cell_width: u32,
+    cell_height: u32,
+) void {
+    const fb_w: usize = cpu.width;
+    const fb_h: usize = cpu.height;
+    const ch: usize = cell_height;
+    const cw: usize = cell_width;
+
+    const bar_h: usize = ch + 4;
+    if (fb_h < bar_h + ch) return;
+    const bar_y = fb_h - bar_h;
+    const bar_bg: u32 = 0xFF1D1D23;
+
+    for (bar_y..fb_h) |y| {
+        if (y >= fb_h) break;
+        const row_start = y * fb_w;
+        const end = @min(row_start + fb_w, cpu.framebuffer.len);
+        if (row_start < end) {
+            @memset(cpu.framebuffer[row_start..end], bar_bg);
+        }
+    }
+
+    // Top separator
+    if (bar_y > 0 and bar_y < fb_h) {
+        const sep_start = bar_y * fb_w;
+        const sep_end = @min(sep_start + fb_w, cpu.framebuffer.len);
+        if (sep_start < sep_end) {
+            @memset(cpu.framebuffer[sep_start..sep_end], 0xFF38384C);
+        }
+    }
+
+    const text_y = bar_y + 2;
+
+    // Left: workspace + pane info
+    var left_buf: [64]u8 = undefined;
+    const ws_num = mux.active_workspace + 1;
+    const active_idx = blk: {
+        const ws = &mux.layout_engine.workspaces[mux.active_workspace];
+        break :blk ws.active_index + 1;
+    };
+    const total_panes = mux.panes.items.len;
+    const left_text = std.fmt.bufPrint(&left_buf, " [{d}] {d}/{d}", .{ ws_num, active_idx, total_panes }) catch " [?]";
+
+    var x: usize = 0;
+    for (left_text) |ch_byte| {
+        if (ch_byte == '[' or ch_byte == ']') {
+            blitCharAt(cpu, ch_byte, x, text_y, 0xFFFF9922);
+        } else if (ch_byte >= '0' and ch_byte <= '9') {
+            blitCharAt(cpu, ch_byte, x, text_y, 0xFF2DD9F0);
+        } else {
+            blitCharAt(cpu, ch_byte, x, text_y, 0xFF64647E);
+        }
+        x += cw;
+    }
+
+    // Separator
+    x += cw;
+    blitCharAt(cpu, '|', x, text_y, 0xFF38384C);
+    x += cw * 2;
+
+    // Center: label
+    const center_text = "shell";
+    for (center_text) |ch_byte| {
+        blitCharAt(cpu, ch_byte, x, text_y, 0xFFC9CBD7);
+        x += cw;
+    }
+
+    // Right: dimensions + help hint
+    var right_buf: [64]u8 = undefined;
+    const right_text = std.fmt.bufPrint(&right_buf, "{d}x{d}  C-Space ?", .{ grid_cols, grid_rows }) catch "";
+    const right_start = if (fb_w > right_text.len * cw + cw) fb_w - right_text.len * cw - cw else 0;
+    var rx = right_start;
+    for (right_text) |ch_byte| {
+        if (ch_byte >= '0' and ch_byte <= '9') {
+            blitCharAt(cpu, ch_byte, rx, text_y, 0xFF8683FF);
+        } else {
+            blitCharAt(cpu, ch_byte, rx, text_y, 0xFF64647E);
+        }
+        rx += cw;
+    }
+}
+
+/// Blit a single character at a pixel position using the atlas.
+fn blitCharAt(cpu: *render.SoftwareRenderer, char: u8, screen_x: usize, screen_y: usize, fg: u32) void {
+    if (char < 32 or char >= 127) return;
+    if (cpu.atlas_width == 0 or cpu.glyph_atlas.len == 0) return;
+
+    const cw: usize = cpu.cell_width;
+    const ch: usize = cpu.cell_height;
+    const aw: usize = cpu.atlas_width;
+    const fb_w: usize = cpu.width;
+    const fb_h: usize = cpu.height;
+
+    const glyph_index: usize = char - 32;
+    const glyphs_per_row = if (aw >= cw) aw / cw else return;
+    const glyph_row = glyph_index / glyphs_per_row;
+    const glyph_col = glyph_index % glyphs_per_row;
+    const atlas_x = glyph_col * cw;
+    const atlas_y = glyph_row * ch;
+
+    const fg_r: u16 = @truncate((fg >> 16) & 0xFF);
+    const fg_g: u16 = @truncate((fg >> 8) & 0xFF);
+    const fg_b: u16 = @truncate(fg & 0xFF);
+
+    for (0..ch) |dy| {
+        if (screen_y + dy >= fb_h) break;
+        if (atlas_y + dy >= cpu.atlas_height) break;
+        const atlas_row_offset = (atlas_y + dy) * aw + atlas_x;
+        if (atlas_row_offset + cw > cpu.glyph_atlas.len) break;
+
+        for (0..cw) |dx| {
+            if (screen_x + dx >= fb_w) break;
+            const alpha: u16 = cpu.glyph_atlas[atlas_row_offset + dx];
+            if (alpha == 0) continue;
+
+            const fb_idx = (screen_y + dy) * fb_w + (screen_x + dx);
+            if (fb_idx >= cpu.framebuffer.len) continue;
+
+            if (alpha == 255) {
+                cpu.framebuffer[fb_idx] = fg;
+            } else {
+                const bg = cpu.framebuffer[fb_idx];
+                const bg_r: u16 = @truncate((bg >> 16) & 0xFF);
+                const bg_g: u16 = @truncate((bg >> 8) & 0xFF);
+                const bg_b: u16 = @truncate(bg & 0xFF);
+                const inv: u16 = 255 - alpha;
+                const r = (fg_r * alpha + bg_r * inv) / 255;
+                const g = (fg_g * alpha + bg_g * inv) / 255;
+                const b = (fg_b * alpha + bg_b * inv) / 255;
+                cpu.framebuffer[fb_idx] = (0xFF << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
+            }
         }
     }
 }
@@ -646,3 +1066,4 @@ fn handleSigwinch(_: posix.SIG) callconv(.c) void {
     if (posix.system.ioctl(g_host_fd, posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) return;
     _ = posix.system.ioctl(g_pty_master_fd, posix.T.IOCSWINSZ, @intFromPtr(&ws));
 }
+

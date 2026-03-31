@@ -34,6 +34,8 @@ pub const Cell = struct {
     }
 };
 
+pub const CursorShape = enum { block, underline, bar };
+
 cells: []Cell,
 rows: u16,
 cols: u16,
@@ -42,6 +44,8 @@ cursor_col: u16 = 0,
 scroll_top: u16 = 0,
 scroll_bottom: u16,
 dirty: bool = true,
+cursor_shape: CursorShape = .block,
+bell: bool = false,
 
 /// Optional scrollback buffer. When set, lines that scroll off the top
 /// are captured as text and pushed to the scrollback.

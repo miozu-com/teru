@@ -33,7 +33,12 @@ pub const GlyphInfo = struct {
 atlas_data: []u8,
 atlas_width: u32,
 atlas_height: u32,
-glyphs: [128]?GlyphInfo,
+/// ASCII + Latin-1 Supplement (codepoints 0-255)
+glyphs: [256]?GlyphInfo,
+/// Box Drawing (U+2500-U+257F)
+box_glyphs: [128]?GlyphInfo,
+/// Block Elements (U+2580-U+259F)
+block_glyphs: [32]?GlyphInfo,
 cell_width: u32,
 cell_height: u32,
 allocator: std.mem.Allocator,
@@ -74,44 +79,76 @@ pub fn init(allocator: std.mem.Allocator, font_path: ?[]const u8, font_size: u16
 
     if (cell_w == 0 or cell_h == 0) return error.InvalidFontMetrics;
 
-    // Atlas layout: 16 glyphs per row, ceil(95/16) = 6 rows
+    // Glyph ranges to rasterize:
+    //   ASCII printable:     32-126  (95 glyphs)
+    //   Latin-1 Supplement: 160-255  (96 glyphs)
+    //   Box Drawing:     0x2500-0x257F (128 glyphs)
+    //   Block Elements:  0x2580-0x259F (32 glyphs)
+    // Total: 351 glyphs
+    const total_glyphs: u32 = 95 + 96 + 128 + 32; // 351
     const glyphs_per_row: u32 = 16;
-    const num_glyphs: u32 = 95; // ASCII 32-126
-    const num_rows: u32 = (num_glyphs + glyphs_per_row - 1) / glyphs_per_row;
+    const num_rows: u32 = (total_glyphs + glyphs_per_row - 1) / glyphs_per_row; // 22
     const atlas_w = glyphs_per_row * cell_w;
     const atlas_h = num_rows * cell_h;
 
     const atlas_data = try allocator.alloc(u8, atlas_w * atlas_h);
     @memset(atlas_data, 0);
 
-    // Rasterize each glyph
-    var glyphs: [128]?GlyphInfo = [_]?GlyphInfo{null} ** 128;
+    // Initialize glyph tables
+    var glyphs: [256]?GlyphInfo = [_]?GlyphInfo{null} ** 256;
+    var box_glyphs: [128]?GlyphInfo = [_]?GlyphInfo{null} ** 128;
+    var block_glyphs: [32]?GlyphInfo = [_]?GlyphInfo{null} ** 32;
     const baseline: i32 = @intFromFloat(f_ascent);
 
-    for (0..num_glyphs) |i| {
-        const codepoint: u21 = @intCast(i + 32);
-        const col = i % glyphs_per_row;
-        const row = i / glyphs_per_row;
+    // Build a flat list of codepoints to rasterize
+    const Codepoint = struct { cp: u21, slot: u32 };
+    var codepoints: [total_glyphs]Codepoint = undefined;
+    var slot: u32 = 0;
+
+    // ASCII printable: 32-126
+    for (32..127) |cp| {
+        codepoints[slot] = .{ .cp = @intCast(cp), .slot = slot };
+        slot += 1;
+    }
+    // Latin-1 Supplement: 160-255
+    for (160..256) |cp| {
+        codepoints[slot] = .{ .cp = @intCast(cp), .slot = slot };
+        slot += 1;
+    }
+    // Box Drawing: U+2500-U+257F
+    for (0x2500..0x2580) |cp| {
+        codepoints[slot] = .{ .cp = @intCast(cp), .slot = slot };
+        slot += 1;
+    }
+    // Block Elements: U+2580-U+259F
+    for (0x2580..0x25A0) |cp| {
+        codepoints[slot] = .{ .cp = @intCast(cp), .slot = slot };
+        slot += 1;
+    }
+
+    for (codepoints[0..slot]) |entry| {
+        const col = entry.slot % glyphs_per_row;
+        const row = entry.slot / glyphs_per_row;
         const atlas_x: u32 = @intCast(col * cell_w);
         const atlas_y: u32 = @intCast(row * cell_h);
 
         // Get glyph metrics
-        var advance: c_int = 0;
+        var advance_c: c_int = 0;
         var lsb: c_int = 0;
-        stbtt.stbtt_GetCodepointHMetrics(&font_info, @intCast(codepoint), &advance, &lsb);
+        stbtt.stbtt_GetCodepointHMetrics(&font_info, @intCast(entry.cp), &advance_c, &lsb);
 
         var ix0: c_int = 0;
         var iy0: c_int = 0;
         var ix1: c_int = 0;
         var iy1: c_int = 0;
-        stbtt.stbtt_GetCodepointBitmapBox(&font_info, @intCast(codepoint), scale, scale, &ix0, &iy0, &ix1, &iy1);
+        stbtt.stbtt_GetCodepointBitmapBox(&font_info, @intCast(entry.cp), scale, scale, &ix0, &iy0, &ix1, &iy1);
 
-        const glyph_w: u32 = @intCast(ix1 - ix0);
-        const glyph_h: u32 = @intCast(iy1 - iy0);
+        const glyph_w: u32 = @intCast(@max(0, ix1 - ix0));
+        const glyph_h: u32 = @intCast(@max(0, iy1 - iy0));
 
         if (glyph_w > 0 and glyph_h > 0 and glyph_w <= cell_w and glyph_h <= cell_h) {
             // Render glyph into atlas
-            const offset_y: u32 = @intCast(baseline + iy0);
+            const offset_y: u32 = @intCast(@max(0, baseline + iy0));
             const offset_x: u32 = @intCast(@max(0, ix0));
             const dst_x = atlas_x + @min(offset_x, cell_w - 1);
             const dst_y = atlas_y + @min(offset_y, cell_h - 1);
@@ -124,19 +161,28 @@ pub fn init(allocator: std.mem.Allocator, font_path: ?[]const u8, font_size: u16
                 @intCast(atlas_w),
                 scale,
                 scale,
-                @intCast(codepoint),
+                @intCast(entry.cp),
             );
         }
 
-        glyphs[codepoint] = GlyphInfo{
+        const info = GlyphInfo{
             .atlas_x = @intCast(atlas_x),
             .atlas_y = @intCast(atlas_y),
             .width = @intCast(glyph_w),
             .height = @intCast(glyph_h),
             .bearing_x = @intCast(ix0),
             .bearing_y = @intCast(iy0),
-            .advance = @intCast(@as(u32, @intFromFloat(@ceil(@as(f32, @floatFromInt(advance)) * scale)))),
+            .advance = @intCast(@as(u32, @intFromFloat(@ceil(@as(f32, @floatFromInt(advance_c)) * scale)))),
         };
+
+        // Store in the correct lookup table
+        if (entry.cp < 256) {
+            glyphs[entry.cp] = info;
+        } else if (entry.cp >= 0x2500 and entry.cp < 0x2580) {
+            box_glyphs[entry.cp - 0x2500] = info;
+        } else if (entry.cp >= 0x2580 and entry.cp < 0x25A0) {
+            block_glyphs[entry.cp - 0x2580] = info;
+        }
     }
 
     return FontAtlas{
@@ -144,6 +190,8 @@ pub fn init(allocator: std.mem.Allocator, font_path: ?[]const u8, font_size: u16
         .atlas_width = atlas_w,
         .atlas_height = atlas_h,
         .glyphs = glyphs,
+        .box_glyphs = box_glyphs,
+        .block_glyphs = block_glyphs,
         .cell_width = cell_w,
         .cell_height = cell_h,
         .allocator = allocator,
@@ -157,7 +205,21 @@ pub fn deinit(self: *FontAtlas) void {
 }
 
 pub fn getGlyph(self: *const FontAtlas, codepoint: u21) ?GlyphInfo {
-    if (codepoint < 128) return self.glyphs[codepoint];
+    if (codepoint < 256) return self.glyphs[codepoint];
+    if (codepoint >= 0x2500 and codepoint < 0x2580)
+        return self.box_glyphs[codepoint - 0x2500];
+    if (codepoint >= 0x2580 and codepoint < 0x25A0)
+        return self.block_glyphs[codepoint - 0x2580];
+    return null;
+}
+
+/// Convert a codepoint to its atlas slot index (for renderer blitting).
+/// Returns null if the codepoint is not in the atlas.
+pub fn glyphSlot(codepoint: u21) ?u32 {
+    if (codepoint >= 32 and codepoint < 127) return @as(u32, codepoint - 32);
+    if (codepoint >= 160 and codepoint < 256) return @as(u32, codepoint - 160) + 95;
+    if (codepoint >= 0x2500 and codepoint < 0x2580) return @as(u32, codepoint - 0x2500) + 95 + 96;
+    if (codepoint >= 0x2580 and codepoint < 0x25A0) return @as(u32, codepoint - 0x2580) + 95 + 96 + 128;
     return null;
 }
 
@@ -258,4 +320,48 @@ test "GlyphInfo has expected fields" {
 test "preferred font list is not empty" {
     try std.testing.expect(preferred_fonts.len > 0);
     try std.testing.expect(font_search_paths.len > 0);
+}
+
+test "glyphSlot: ASCII range" {
+    // Space (32) = slot 0
+    try std.testing.expectEqual(@as(?u32, 0), glyphSlot(32));
+    // 'A' (65) = slot 33
+    try std.testing.expectEqual(@as(?u32, 33), glyphSlot('A'));
+    // '~' (126) = slot 94
+    try std.testing.expectEqual(@as(?u32, 94), glyphSlot(126));
+    // DEL (127) = not in atlas
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(127));
+}
+
+test "glyphSlot: Latin-1 Supplement" {
+    // 160 (NBSP) = slot 95
+    try std.testing.expectEqual(@as(?u32, 95), glyphSlot(160));
+    // 255 = slot 190
+    try std.testing.expectEqual(@as(?u32, 190), glyphSlot(255));
+    // 128-159: not in atlas (C1 controls)
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(128));
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(159));
+}
+
+test "glyphSlot: Box Drawing" {
+    // U+2500 = slot 191
+    try std.testing.expectEqual(@as(?u32, 191), glyphSlot(0x2500));
+    // U+257F = slot 318
+    try std.testing.expectEqual(@as(?u32, 318), glyphSlot(0x257F));
+}
+
+test "glyphSlot: Block Elements" {
+    // U+2580 = slot 319
+    try std.testing.expectEqual(@as(?u32, 319), glyphSlot(0x2580));
+    // U+259F = slot 350
+    try std.testing.expectEqual(@as(?u32, 350), glyphSlot(0x259F));
+    // U+25A0 = not in atlas
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(0x25A0));
+}
+
+test "glyphSlot: out of range" {
+    // CJK character - not in atlas
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(0x4E2D));
+    // Emoji - not in atlas
+    try std.testing.expectEqual(@as(?u32, null), glyphSlot(0x1F600));
 }

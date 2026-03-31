@@ -306,6 +306,7 @@ pub const X11Window = struct {
                         .x = @intCast(@max(0, btn.event_x)),
                         .y = @intCast(@max(0, btn.event_y)),
                         .button = mb,
+                        .modifiers = @intCast(btn.state),
                     } };
                 }
                 return .none;
@@ -318,6 +319,7 @@ pub const X11Window = struct {
                         .x = @intCast(@max(0, btn.event_x)),
                         .y = @intCast(@max(0, btn.event_y)),
                         .button = mb,
+                        .modifiers = @intCast(btn.state),
                     } };
                 }
                 return .none;
@@ -352,6 +354,14 @@ pub const X11Window = struct {
         const row_bytes = fb_width * 4;
 
         _ = xcb_put_image(self.connection, XCB_IMAGE_FORMAT_Z_PIXMAP, self.window, self.gc, @intCast(blit_w), @intCast(blit_h), 0, 0, 0, self.depth, blit_h * row_bytes, data);
+        _ = xcb_flush(self.connection);
+    }
+
+    pub fn setTitle(self: *X11Window, title: []const u8) void {
+        const net_wm_name = internAtom(self.connection, "_NET_WM_NAME", false);
+        const utf8_atom = internAtom(self.connection, "UTF8_STRING", false);
+        _ = xcb_change_property(self.connection, XCB_PROP_MODE_REPLACE, self.window, net_wm_name, utf8_atom, 8, @intCast(title.len), title.ptr);
+        _ = xcb_change_property(self.connection, XCB_PROP_MODE_REPLACE, self.window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, @intCast(title.len), title.ptr);
         _ = xcb_flush(self.connection);
     }
 

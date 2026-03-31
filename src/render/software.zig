@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Grid = @import("../core/Grid.zig");
+const FontAtlas = @import("FontAtlas.zig");
 
 // ── SIMD types ─────────────────────────────────────────────────────
 // Process 4 pixels at a time (128-bit — works on SSE2, NEON, and
@@ -179,23 +180,23 @@ pub const SoftwareRenderer = struct {
 
                 // 2. Blit glyph from atlas with foreground color (alpha blending)
                 const cp = cell.char;
-                if (cp >= 32 and cp < 127 and self.atlas_width > 0 and self.glyph_atlas.len > 0) {
-                    self.blitGlyph(
-                        cp - 32,
-                        screen_x,
-                        screen_y,
-                        max_x,
-                        max_y,
-                        fg,
-                        bg,
-                    );
+                if (self.atlas_width > 0 and self.glyph_atlas.len > 0) {
+                    if (FontAtlas.glyphSlot(cp)) |slot| {
+                        self.blitGlyph(
+                            @intCast(slot),
+                            screen_x,
+                            screen_y,
+                            max_x,
+                            max_y,
+                            fg,
+                            bg,
+                        );
+                    }
                 }
             }
         }
 
-        // 3. Draw cursor (block style — filled rectangle at cursor position)
-        // NOTE: Grid does not yet track cursor_visible (ESC[?25h/l).
-        // When that field is added, gate this block on it.
+        // 3. Draw cursor at cursor position (shape from grid.cursor_shape)
         if (grid.cursor_row < grid.rows and grid.cursor_col < grid.cols) {
             const cx: usize = @as(usize, grid.cursor_col) * cw + self.padding;
             const cy: usize = @as(usize, grid.cursor_row) * ch + self.padding;
@@ -204,9 +205,31 @@ pub const SoftwareRenderer = struct {
             const cursor_max_y = @min(cy + ch, fb_h);
             const cursor_max_x = @min(cx + cw, fb_w);
 
-            for (cy..cursor_max_y) |py| {
-                const row_start = py * fb_w;
-                @memset(self.framebuffer[row_start + cx .. row_start + cursor_max_x], cursor_color);
+            switch (grid.cursor_shape) {
+                .block => {
+                    for (cy..cursor_max_y) |py| {
+                        const row_start = py * fb_w;
+                        @memset(self.framebuffer[row_start + cx .. row_start + cursor_max_x], cursor_color);
+                    }
+                },
+                .underline => {
+                    // Fill bottom 2 rows of the cell
+                    const ul_start = if (ch >= 2) cy + ch - 2 else cy;
+                    const ul_min = @min(ul_start, fb_h);
+                    for (ul_min..cursor_max_y) |py| {
+                        const row_start = py * fb_w;
+                        @memset(self.framebuffer[row_start + cx .. row_start + cursor_max_x], cursor_color);
+                    }
+                },
+                .bar => {
+                    // Fill left 2 columns of the cell
+                    const bar_w = @min(@as(usize, 2), cw);
+                    const bar_max_x = @min(cx + bar_w, fb_w);
+                    for (cy..cursor_max_y) |py| {
+                        const row_start = py * fb_w;
+                        @memset(self.framebuffer[row_start + cx .. row_start + bar_max_x], cursor_color);
+                    }
+                },
             }
         }
     }
@@ -655,4 +678,66 @@ test "blitGlyphRow SIMD and scalar produce same results" {
     // Verify pixel 2 (alpha=128): should be roughly halfway
     const mid_r = (dst[2] >> 16) & 0xFF;
     try std.testing.expect(mid_r >= 125 and mid_r <= 130);
+}
+
+test "cursor rendered as underline" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 1, 1);
+    defer grid.deinit(allocator);
+
+    grid.cursor_row = 0;
+    grid.cursor_col = 0;
+    grid.cursor_shape = .underline;
+
+    const cw: u32 = 4;
+    const ch: u32 = 4;
+    var renderer = try SoftwareRenderer.init(allocator, cw, ch, cw, ch);
+    renderer.padding = 0;
+    defer renderer.deinit();
+
+    renderer.render(&grid);
+
+    const cursor_color: u32 = 0xFFFF9922;
+    const bg = resolveColorArgb(.default, false);
+
+    // Top rows should be background (not cursor)
+    try std.testing.expectEqual(bg, renderer.framebuffer[0]); // row 0
+    try std.testing.expectEqual(bg, renderer.framebuffer[cw]); // row 1
+
+    // Bottom 2 rows should be cursor color
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[2 * cw]); // row 2, col 0
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[2 * cw + 1]); // row 2, col 1
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[3 * cw]); // row 3, col 0
+}
+
+test "cursor rendered as bar" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 1, 1);
+    defer grid.deinit(allocator);
+
+    grid.cursor_row = 0;
+    grid.cursor_col = 0;
+    grid.cursor_shape = .bar;
+
+    const cw: u32 = 4;
+    const ch: u32 = 4;
+    var renderer = try SoftwareRenderer.init(allocator, cw, ch, cw, ch);
+    renderer.padding = 0;
+    defer renderer.deinit();
+
+    renderer.render(&grid);
+
+    const cursor_color: u32 = 0xFFFF9922;
+    const bg = resolveColorArgb(.default, false);
+
+    // Left 2 columns of each row should be cursor color
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[0]); // row 0, col 0
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[1]); // row 0, col 1
+    try std.testing.expectEqual(bg, renderer.framebuffer[2]); // row 0, col 2 (not cursor)
+    try std.testing.expectEqual(bg, renderer.framebuffer[3]); // row 0, col 3 (not cursor)
+
+    // Second row, left 2 = cursor
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[cw]); // row 1, col 0
+    try std.testing.expectEqual(cursor_color, renderer.framebuffer[cw + 1]); // row 1, col 1
+    try std.testing.expectEqual(bg, renderer.framebuffer[cw + 2]); // row 1, col 2
 }

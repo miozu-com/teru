@@ -15,6 +15,7 @@ pub const MouseEvent = struct {
     x: u32, // pixel x
     y: u32, // pixel y
     button: MouseButton,
+    modifiers: u32 = 0, // keyboard modifiers (e.g., Ctrl, Shift)
 };
 
 pub const Event = union(enum) {

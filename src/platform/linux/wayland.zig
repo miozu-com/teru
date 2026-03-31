@@ -551,6 +551,15 @@ pub const WaylandWindow = struct {
         _ = wl_display_flush(self.display);
     }
 
+    pub fn setTitle(self: *WaylandWindow, title: []const u8) void {
+        // xdg_toplevel_set_title requires a null-terminated string
+        var buf: [257]u8 = undefined;
+        const len = @min(title.len, buf.len - 1);
+        @memcpy(buf[0..len], title[0..len]);
+        buf[len] = 0;
+        xdg_toplevel_set_title(self.xdg_toplevel_ptr, @ptrCast(&buf));
+    }
+
     pub fn getSize(self: *const WaylandWindow) platform.Size {
         return .{ .width = self.width, .height = self.height };
     }

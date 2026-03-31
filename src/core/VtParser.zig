@@ -51,6 +51,7 @@ osc_len: u16 = 0,
 /// Parsed title from OSC 0
 title: [MAX_OSC_LEN]u8 = [_]u8{0} ** MAX_OSC_LEN,
 title_len: u16 = 0,
+title_changed: bool = false,
 
 /// UTF-8 decoder state
 utf8_buf: [4]u8 = undefined,
@@ -219,7 +220,9 @@ fn handleGround(self: *VtParser, byte: u8) void {
         0x1B => { // ESC
             self.state = .escape;
         },
-        0x07 => {}, // BEL — ignore in ground
+        0x07 => { // BEL — visual bell
+            self.grid.bell = true;
+        },
         0x08 => { // BS (backspace)
             if (self.grid.cursor_col > 0) {
                 self.grid.cursor_col -= 1;
@@ -439,7 +442,17 @@ fn handleCsiIntermediate(self: *VtParser, byte: u8) void {
             // Another intermediate byte (rare, ignore)
         },
         0x40...0x7E => {
-            // Final byte — we don't handle intermediates currently
+            // Final byte with intermediate
+            if (self.intermediate == ' ' and byte == 'q') {
+                // DECSCUSR — set cursor shape
+                const n = self.getParam(0, 1);
+                self.grid.cursor_shape = switch (n) {
+                    0, 1, 2 => .block,
+                    3, 4 => .underline,
+                    5, 6 => .bar,
+                    else => .block,
+                };
+            }
             self.state = .ground;
         },
         else => {
@@ -491,6 +504,7 @@ fn finishOsc(self: *VtParser) void {
                 const copy_len = @min(payload.len, MAX_OSC_LEN);
                 @memcpy(self.title[0..copy_len], payload[0..copy_len]);
                 self.title_len = @intCast(copy_len);
+                self.title_changed = true;
             },
             10 => {
                 // Query/set foreground color. "?" = query.
@@ -1615,4 +1629,97 @@ test "unknown CSI sequences are silently absorbed" {
     try std.testing.expectEqual(@as(u21, 'O'), grid.cellAtConst(0, 0).char);
     try std.testing.expectEqual(@as(u21, 'K'), grid.cellAtConst(0, 1).char);
     try std.testing.expectEqual(@as(u16, 2), grid.cursor_col);
+}
+
+test "DECSCUSR: cursor shape block" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // ESC[ 2 SP q -> steady block
+    parser.feed("\x1b[2 q");
+    try std.testing.expectEqual(Grid.CursorShape.block, grid.cursor_shape);
+}
+
+test "DECSCUSR: cursor shape underline" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // ESC[ 4 SP q -> steady underline
+    parser.feed("\x1b[4 q");
+    try std.testing.expectEqual(Grid.CursorShape.underline, grid.cursor_shape);
+}
+
+test "DECSCUSR: cursor shape bar" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // ESC[ 6 SP q -> steady bar
+    parser.feed("\x1b[6 q");
+    try std.testing.expectEqual(Grid.CursorShape.bar, grid.cursor_shape);
+}
+
+test "DECSCUSR: cursor shape blinking variants" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    // 0 -> block (default)
+    parser.feed("\x1b[0 q");
+    try std.testing.expectEqual(Grid.CursorShape.block, grid.cursor_shape);
+
+    // 3 -> blinking underline
+    parser.feed("\x1b[3 q");
+    try std.testing.expectEqual(Grid.CursorShape.underline, grid.cursor_shape);
+
+    // 5 -> blinking bar
+    parser.feed("\x1b[5 q");
+    try std.testing.expectEqual(Grid.CursorShape.bar, grid.cursor_shape);
+
+    // 1 -> blinking block
+    parser.feed("\x1b[1 q");
+    try std.testing.expectEqual(Grid.CursorShape.block, grid.cursor_shape);
+}
+
+test "BEL sets bell flag" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    try std.testing.expect(!grid.bell);
+    parser.feed("\x07");
+    try std.testing.expect(grid.bell);
+
+    // Clearing and re-triggering
+    grid.bell = false;
+    parser.feed("Hello\x07");
+    try std.testing.expect(grid.bell);
+}
+
+test "OSC 0 sets title and title_changed flag" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 24, 80);
+    defer grid.deinit(allocator);
+    var parser = VtParser.init(allocator, &grid);
+
+    try std.testing.expect(!parser.title_changed);
+
+    // OSC 0 ; title BEL
+    parser.feed("\x1b]0;my window title\x07");
+    try std.testing.expect(parser.title_changed);
+    try std.testing.expectEqual(@as(u16, 15), parser.title_len);
+    try std.testing.expectEqualSlices(u8, "my window title", parser.title[0..parser.title_len]);
+
+    // Clear flag and send another title
+    parser.title_changed = false;
+    parser.feed("\x1b]0;new title\x07");
+    try std.testing.expect(parser.title_changed);
+    try std.testing.expectEqualSlices(u8, "new title", parser.title[0..parser.title_len]);
 }

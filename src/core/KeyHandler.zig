@@ -5,6 +5,7 @@
 //! into these helpers rather than inlining the logic.
 
 const std = @import("std");
+const posix = std.posix;
 const Io = std.Io;
 const Multiplexer = @import("Multiplexer.zig");
 const ProcessGraph = @import("../graph/ProcessGraph.zig");
@@ -35,9 +36,22 @@ pub const PrefixState = struct {
     }
 };
 
+// ── Mux command result ──────────────────────────────────────────
+
+/// Action returned by handleMuxCommand for the caller to act on.
+pub const MuxAction = enum {
+    none,
+    enter_search,
+};
+
 // ── Mux command dispatch ─────────────────────────────────────────
 
+fn writeMsg(msg: []const u8) void {
+    _ = std.c.write(posix.STDOUT_FILENO, msg.ptr, msg.len);
+}
+
 /// Handle a multiplexer command after the prefix key (Ctrl+Space).
+/// Returns an action the caller should handle (e.g., entering search mode).
 pub fn handleMuxCommand(
     cmd: u8,
     mux: *Multiplexer,
@@ -47,11 +61,11 @@ pub fn handleMuxCommand(
     grid_rows: u16,
     grid_cols: u16,
     io: Io,
-) void {
+) MuxAction {
     switch (cmd) {
         'c' => {
             // Spawn new pane
-            const id = mux.spawnPane(grid_rows, grid_cols) catch return;
+            const id = mux.spawnPane(grid_rows, grid_cols) catch return .none;
             if (mux.getPaneById(id)) |pane| {
                 // Graph registration failure is non-fatal: pane works without tracking
                 _ = graph.spawn(.{ .name = "shell", .kind = .shell, .pid = pane.pty.child_pid }) catch {};
@@ -75,11 +89,22 @@ pub fn handleMuxCommand(
         ' ' => mux.cycleLayout(),
         'd' => {
             // Detach: save session and exit
-            mux.saveSession(graph, "/tmp/teru-session.bin", io) catch {
-                // Session save failed — still detach (data loss over hang)
+            const path = "/tmp/teru-session.bin";
+            const pane_n = mux.panes.items.len;
+            mux.saveSession(graph, path, io) catch {
+                writeMsg("[teru] Session save failed, exiting anyway\n");
+                running.* = false;
+                return .none;
             };
             hooks.fire(.session_save);
+            var dbuf: [256]u8 = undefined;
+            const dmsg = std.fmt.bufPrint(&dbuf, "[teru] Session saved to {s} ({d} panes)\n[teru] Note: processes are not preserved. Use --attach to restore layout.\n", .{ path, pane_n }) catch "[teru] Session saved\n";
+            writeMsg(dmsg);
             running.* = false;
+        },
+        '/' => {
+            // Enter search mode (caller handles the UI)
+            return .enter_search;
         },
         '1'...'9' => {
             // Switch workspace (1-based → 0-based)
@@ -95,6 +120,7 @@ pub fn handleMuxCommand(
             }
         },
     }
+    return .none;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
